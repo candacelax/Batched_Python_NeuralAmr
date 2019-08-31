@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-#get_ipython().run_line_magic('matplotlib', 'inline')
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,9 +10,7 @@ import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from tensorboardX import SummaryWriter
 from tqdm import tqdm as tqdm
-#from IPython.core.debugger import set_trace
 
-# we will use CUDA if it is available
 USE_CUDA = torch.cuda.is_available()
 DEVICE=torch.device('cuda:0') # or set to 'cpu'
 print("CUDA:", USE_CUDA)
@@ -26,16 +23,11 @@ torch.cuda.manual_seed(seed)
 
 writer = SummaryWriter()
 
-# # Let's start coding!
-# 
 # ## Model class
 # 
 # Our base model class `EncoderDecoder` is very similar to the one in *The Annotated Transformer*.
 # 
 # One difference is that our encoder also returns its final states (`encoder_final` below), which is used to initialize the decoder RNN. We also provide the sequence lengths as the RNNs require those.
-
-# In[3]:
-
 
 class EncoderDecoder(nn.Module):
     """
@@ -67,9 +59,6 @@ class EncoderDecoder(nn.Module):
 # To keep things easy we also keep the `Generator` class the same. 
 # It simply projects the pre-output layer ($x$ in the `forward` function below) to obtain the output layer, so that the final dimension is the target vocabulary size.
 
-# In[4]:
-
-
 class Generator(nn.Module):
     """Define standard linear + softmax generation step."""
     def __init__(self, hidden_size, vocab_size):
@@ -82,7 +71,7 @@ class Generator(nn.Module):
 
 # ## Encoder
 # 
-# Our encoder is a bi-directional GRU. 
+# Our encoder is a bi-directional LSTM. 
 # 
 # Because we want to process multiple sentences at the same time for speed reasons (it is more effcient on GPU), we need to support **mini-batches**. Sentences in a mini-batch may have different lengths, which means that the RNN needs to unroll further for certain sentences while it might already have finished for others:
 # 
@@ -105,9 +94,6 @@ class Generator(nn.Module):
 # 
 # The code below reads in a source sentence (a sequence of word embeddings) and produces the hidden states.
 # It also returns a final vector, a summary of the complete sentence, by concatenating the first and the last hidden states (they have both seen the whole sentence, each in a different direction). We will use the final vector to initialize the decoder.
-
-# In[5]:
-
 
 class Encoder(nn.Module):
     """Encodes a sequence of word embeddings"""
@@ -151,18 +137,16 @@ class Encoder(nn.Module):
 
 # ### Decoder
 # 
-# The decoder is a conditional GRU. Rather than starting with an empty state like the encoder, its initial hidden state results from a projection of the encoder final vector. 
+# The decoder is a conditional LSTM. Rather than starting with an empty state like the encoder, its initial hidden state results from a projection of the encoder final vector. 
 # 
 # #### Training
 # In `forward` you can find a for-loop that computes the decoder hidden states one time step at a time. 
-# Note that, during training, we know exactly what the target words should be! (They are in `trg_embed`.) This means that we are not even checking here what the prediction is! We simply feed the correct previous target word embedding to the GRU at each time step. This is called teacher forcing.
+# Note that, during training, we know exactly what the target words should be! (They are in `trg_embed`.) This means that we are not even checking here what the prediction is! We simply feed the correct previous target word embedding to the LSTM at each time step. This is called teacher forcing.
 # 
 # The `forward` function returns all decoder hidden states and pre-output vectors. Elsewhere these are used to compute the loss, after which the parameters are updated.
 # 
 # #### Prediction
 # For prediction time, for forward function is only used for a single time step. After predicting a word from the returned pre-output vector, we can call it again, supplying it the word embedding of the previously predicted word and the last state.
-
-# In[6]:
 
 
 class Decoder(nn.Module):
@@ -261,9 +245,7 @@ class Decoder(nn.Module):
 # The state of the decoder is represented by GRU hidden state $\mathbf{s}_i$.
 # So if we want to know which source word representation(s) $\mathbf{h}_j$ are most relevant, we will need to define a function that takes those two things as input.
 # 
-# Here we use the MLP-based, additive attention that was used in Bahdanau et al.:
-# 
-# <img src="images/attention.png" width="280">
+# Here we use the MLP-based, additive attention that was used in Bahdanau et al.
 # 
 # 
 # We apply an MLP with tanh-activation to both the current decoder state $\bf s_i$ (the *query*) and each encoder state $\bf h_j$ (the *key*), and then project this to a single value (i.e. a scalar) to get the *attention energy* $e_{ij}$. 
@@ -276,9 +258,6 @@ class Decoder(nn.Module):
 # 
 # The context vector for time step $i$ is then a weighted sum of the encoder hidden states (the *values*):
 # $$\mathbf{c}_i = \sum_j \alpha_{ij} \mathbf{h}_j$$
-
-# In[7]:
-
 
 class BahdanauAttention(nn.Module):
     """Implements Bahdanau (MLP) attention"""
@@ -334,8 +313,6 @@ class BahdanauAttention(nn.Module):
 # 
 # Here we define a function from hyperparameters to a full model. 
 
-# In[8]:
-
 
 def make_model(src_vocab, tgt_vocab, emb_size=256, hidden_size=512, num_layers=1, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
@@ -360,8 +337,6 @@ def make_model(src_vocab, tgt_vocab, emb_size=256, hidden_size=512, num_layers=1
 # needed to train a standard encoder decoder model. First we define a batch object that holds the src and target sentences for training, as well as their lengths and masks. 
 
 # ## Batches and Masking
-
-# In[9]:
 
 
 class Batch:
@@ -404,8 +379,6 @@ class Batch:
 
 # ## Training Loop
 # The code below trains the model for 1 epoch (=1 pass through the training data).
-
-# In[10]:
 
 
 def run_epoch(data_iter, model, loss_compute, print_every=50):
@@ -452,27 +425,8 @@ def run_epoch(data_iter, model, loss_compute, print_every=50):
 
 # ## Synthetic Data
 
-# In[11]:
-
-
-def data_gen(num_words=11, batch_size=16, num_batches=100, length=10, pad_index=0, sos_index=1):
-    """Generate random data for a src-tgt copy task."""
-    for i in range(num_batches):
-        data = torch.from_numpy(
-          np.random.randint(1, num_words, size=(batch_size, length)))
-        data[:, 0] = sos_index
-        data = data.cuda() if USE_CUDA else data
-        src = data[:, 1:]
-        trg = data
-        src_lengths = [length-1] * batch_size
-        trg_lengths = [length] * batch_size
-        yield Batch((src, src_lengths), (trg, trg_lengths), pad_index=pad_index)
-
 
 # ## Loss Computation
-
-# In[12]:
-
 
 class SimpleLossCompute:
     """A simple loss compute and train function."""
@@ -501,8 +455,6 @@ class SimpleLossCompute:
 # To monitor progress during training, we will translate a few examples.
 # 
 # We use greedy decoding for simplicity; that is, at each time step, starting at the first token, we choose the one with that maximum probability, and we never revisit that choice. 
-
-# In[13]:
 
 
 def greedy_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None):
@@ -552,9 +504,6 @@ def lookup_words(x, vocab=None):
     return [str(t) for t in x]
 
 
-# In[14]:
-
-
 def print_examples(example_iter, model, n=2, max_len=100, 
                    sos_index=1, 
                    src_eos_index=None, 
@@ -597,82 +546,6 @@ def print_examples(example_iter, model, n=2, max_len=100,
         if count == n:
             break
 
-
-# ## Training the copy task
-
-# In[15]:
-
-
-def train_copy_task():
-    """Train the simple copy task."""
-    num_words = 11
-    criterion = nn.NLLLoss(reduction="sum", ignore_index=0)
-    model = make_model(num_words, num_words, emb_size=32, hidden_size=64, num_layers=2)
-    optim = torch.optim.Adam(model.parameters(), lr=0.0003)
-    eval_data = list(data_gen(num_words=num_words, batch_size=1, num_batches=100))
- 
-    dev_perplexities = []
-    
-    if USE_CUDA:
-        model.cuda()
-
-    for epoch in range(10):
-        
-        print("Epoch %d" % epoch)
-
-        # train
-        model.train()
-        data = data_gen(num_words=num_words, batch_size=32, num_batches=100)
-        run_epoch(data, model,
-                  SimpleLossCompute(model.generator, criterion, optim))
-
-        # evaluate
-        model.eval()
-        with torch.no_grad(): 
-            perplexity = run_epoch(eval_data, model,
-                                   SimpleLossCompute(model.generator, criterion, None))
-            print("Evaluation perplexity: %f" % perplexity)
-            dev_perplexities.append(perplexity)
-            print_examples(eval_data, model, n=2, max_len=9)
-        
-    return dev_perplexities
-
-
-# In[16]:
-
-
-# train the copy task
-#dev_perplexities = train_copy_task()
-
-def plot_perplexity(perplexities):
-    """plot perplexities"""
-    plt.title("Perplexity per Epoch")
-    plt.xlabel("Epoch")
-    plt.ylabel("Perplexity")
-    plt.plot(perplexities)
-    
-#plot_perplexity(dev_perplexities)
-
-
-# You can see that the model managed to correctly 'translate' the two examples in the end.
-# 
-# Moreover, the perplexity of the development data nicely went down towards 1.
-
-# # A Real World Example
-# 
-# Now we consider a real-world example using the IWSLT German-English Translation task. 
-# This task is much smaller than usual, but it illustrates the whole system. 
-# 
-# The cell below installs torch text and spacy. This might take a while.
-
-# In[17]:
-
-
-#!pip install git+git://github.com/pytorch/text spacy 
-#!python -m spacy download en
-#!python -m spacy download de
-
-
 # ## Data Loading
 # 
 # We will load the dataset using torchtext and spacy for tokenization.
@@ -680,11 +553,6 @@ def plot_perplexity(perplexities):
 # This cell might take a while to run the first time, as it will download and tokenize the IWSLT data.
 # 
 # For speed we only include short sentences, and we include a word in the vocabulary only if it occurs at least 5 times. In this case we also lowercase the data.
-# 
-# If you have **issues** with torch text in the cell below (e.g. an `ascii` error), try running `export LC_ALL="en_US.UTF-8"` before you start `jupyter notebook`.
-
-# In[18]:
-
 
 # For data loading.
 from torchtext import data, datasets
@@ -752,8 +620,8 @@ def print_data_info(my_data, src_field, trg_field):
     print("\n".join(
         '%02d %s' % (i, t) for i, t in enumerate(trg_field.vocab.itos[:10])), "\n")
 
-    print("Number of German words (types):", len(src_field.vocab))
-    print("Number of English words (types):", len(trg_field.vocab), "\n")
+    print("Number of NL words (types):", len(src_field.vocab))
+    print("Number of AMR words (types):", len(trg_field.vocab), "\n")
     
     
 print_data_info(my_data, SRC, TRG)
@@ -766,8 +634,6 @@ print_data_info(my_data, SRC, TRG)
 # 
 # For effiency reasons, PyTorch RNNs require that batches have been sorted by length, with the longest sentence in the batch first. For training, we simply sort each batch. 
 # For validation, we would run into trouble if we want to compare our translations with some external file that was not sorted. Therefore we simply set the validation batch size to 1, so that we can keep it in the original order.
-
-# In[20]:
 
 
 train_iter = data.BucketIterator(my_data["train"], batch_size=100, train=True, 
@@ -790,9 +656,6 @@ def rebatch(pad_idx, batch):
 # Now we train the model. 
 # 
 # On a Titan X GPU, this runs at ~18,000 tokens per second with a batch size of 64.
-
-# In[21]:
-
 
 def train(model, num_epochs=10, lr=0.0003, print_every=100):
     """Train a model on IWSLT"""
@@ -834,22 +697,11 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100):
     return dev_perplexities
         
 
-#dummy_model = make_model(len(SRC.vocab), len(TRG.vocab),
-#                   emb_size=256, hidden_size=500,
-#                   num_layers=2, dropout=0.5)
-#dummy_input = 
-
-# In[22]:
-
-
 model = make_model(len(SRC.vocab), len(TRG.vocab),
                    emb_size=500, hidden_size=500,
                    num_layers=2, dropout=0.5)
 dev_perplexities = train(model, num_epochs=60, print_every=500)
 torch.save(model, "20_epochs.pt")
-
-
-# In[23]:
 
 
 plot_perplexity(dev_perplexities)
@@ -868,23 +720,14 @@ plot_perplexity(dev_perplexities)
 # 
 # We'll first test the raw BLEU function:
 
-# In[24]:
-
 
 import sacrebleu
-
-
-# In[25]:
-
 
 # this should result in a perfect BLEU of 100%
 hypotheses = ["this is a test"]
 references = ["this is a test"]
 bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
 print(bleu)
-
-
-# In[26]:
 
 
 # here the BLEU score will be lower, because some n-grams won't match
@@ -896,8 +739,6 @@ print(bleu)
 
 # Since we did some filtering for speed, our validation set contains 690 sentences.
 # The references are the tokenized versions, but they should not contain out-of-vocabulary UNKs that our network might have seen. So we'll take the references straight out of the `valid_data` object:
-
-# In[27]:
 
 
 len(my_data["val"])
@@ -928,7 +769,7 @@ references[-2]
 
 hypotheses = []
 alphas = []  # save the last attention scores
-for batch in val_iter:
+for batch in valid_iter:
   batch = rebatch(PAD_INDEX, batch)
   pred, attention = greedy_decode(
     model, batch.src, batch.src_mask, batch.src_lengths, max_len=MAX_LEN,
@@ -952,8 +793,6 @@ hypotheses = [lookup_words(x, TRG.vocab) for x in hypotheses]
 hypotheses[0]
 
 
-# In[33]:
-
 
 # finally, the SacreBLEU raw scorer requires string input, so we convert the lists to strings
 hypotheses = [" ".join(x) for x in hypotheses]
@@ -964,8 +803,6 @@ with open("val.pred", "w") as file:
     for line in hypotheses:
         file.write(line+"\n\n")
 
-# In[34]:
-
 
 # now we can compute the BLEU score!
 bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
@@ -975,9 +812,6 @@ print(bleu)
 # ## Attention Visualization
 # 
 # We can also visualize the attention scores of the decoder.
-
-# In[47]:
-
 
 def plot_heatmap(src, trg, scores):
 
@@ -999,8 +833,6 @@ def plot_heatmap(src, trg, scores):
     plt.savefig("attn_map.png")
 
 
-# In[71]:
-
 
 # This plots a chosen sentence, for which we saved the attention scores above.
 idx = 5
@@ -1012,27 +844,3 @@ print("src", src)
 print("ref", trg)
 print("pred", pred)
 plot_heatmap(src, pred, pred_att)
-
-
-# # Congratulations! You've finished this notebook.
-# 
-# What didn't we cover?
-# 
-# - Subwords / Byte Pair Encoding [[paper]](https://arxiv.org/abs/1508.07909) [[github]](https://github.com/rsennrich/subword-nmt) let you deal with unknown words. 
-# - You can implement a [multiplicative/bilinear attention mechanism](https://arxiv.org/abs/1508.04025) instead of the additive one used here.
-# - We used greedy decoding here to get translations, but you can get better results with beam search.
-# - The original model only uses a single dropout layer (in the decoder), but you can experiment with adding more dropout layers, for example on the word embeddings and the source word representations.
-# - You can experiment with multiple encoder/decoder layers.- Experiment with a benchmarked and improved codebase: [Joey NMT](https://github.com/joeynmt/joeynmt)
-
-# If this was useful to your research, please consider citing:
-# 
-# > Joost Bastings. 2018. The Annotated Encoder-Decoder with Attention. https://bastings.github.io/annotated_encoder_decoder/
-# 
-# Or use the following `Bibtex`:
-# ```
-# @misc{bastings2018annotated,
-#   title={The Annotated Encoder-Decoder with Attention},
-#   author={Bastings, Joost},
-#   journal={https://bastings.github.io/annotated\_encoder\_decoder/},
-#   year={2018}
-# }```
