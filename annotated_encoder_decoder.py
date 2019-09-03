@@ -456,7 +456,6 @@ class SimpleLossCompute:
 # 
 # We use greedy decoding for simplicity; that is, at each time step, starting at the first token, we choose the one with that maximum probability, and we never revisit that choice. 
 
-
 def greedy_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None):
     """Greedily decode a sentence."""
 
@@ -495,6 +494,65 @@ def greedy_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, e
             output = output[:first_eos[0]]      
     
     return output, np.concatenate(attention_scores, axis=1)
+ 
+class BeamNode():
+    def __init__(self, prev_input, prev_h, logProb, words=[], attentionScores=[]):
+        self.words = words
+        self.prev_input = prev_input
+        self.prev_h = prev_h
+        self.logProb = logProb
+        self.attentionScores = attentionScores
+
+def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None, beam_size=5):
+    """Greedily decode a sentence."""
+
+    with torch.no_grad():
+        encoder_hidden, encoder_final = model.encode(src, src_mask, src_lengths)
+
+    output = []
+    hidden = None
+
+    #for i in range(max_len):
+    i = 0
+    beam_nodes = []
+    beam_nodes.append(BeamNode(sos_index, hidden, 0))
+    ended = False
+    while i<max_len and not ended:
+        for node in beam_nodes:
+            prev_word = node.prev_input
+            prev_y = torch.ones(1, 1).fill_(prev_word).type_as(src)
+            trg_mask = torch.ones_like(prev_y)
+            hidden = node.prev_h
+            with torch.no_grad():
+                out, hidden, pre_output = model.decode(
+                  encoder_hidden, encoder_final, src_mask,
+                  prev_y, trg_mask, hidden)
+
+                # we predict from the pre-output layer, which is
+                # a combination of Decoder state, prev emb, and context
+                prob = model.generator(pre_output[:, -1])
+
+            probs, words = torch.topk(prob, beam_size,  dim=1)
+            for prob, word in zip(probs, words):
+                next_word = next_word.data.item()
+                new_words = node.words.copy().append(next_word)
+                new_prob = node.logProb + prob
+                new_node = BeamNode(next_word, hidden, new_prob, words=new_words)
+                new_node.attention_scores.append(model.decoder.attention.alphas.cpu().numpy())
+                beam_nodes.append(new_node)
+            i+=1
+        beam_nodes = sorted(beam_nodes, key=lambda node: -node.logProb)[:beam_size] 
+        ended = bool(sum([1 if node.prev_input==eos_token else 0 for node in beam_nodes]))
+    output = []
+    attns = []
+    if ended:
+        end_node_i = [1 if node.prev_input==eos_token else 0 for node in beam_nodes].index(1)
+        end_node = beam_nodes[end_node_i]
+    else:
+        end_node = beam_nodes[0]
+    output = np.array(end_node.words)
+    
+    return output, np.concatenate(end_node.attentionScores, axis=1)
   
 
 def lookup_words(x, vocab=None):
@@ -571,7 +629,7 @@ SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
 TRG = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
                  unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
 
-MAX_LEN = 600  # NOTE: we filter out a lot of sentences for speed
+MAX_LEN = 100  # NOTE: we filter out a lot of sentences for speed
 my_data = {}
 
 for split in ["train", "val", "test"]:
@@ -700,7 +758,7 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100):
 model = make_model(len(SRC.vocab), len(TRG.vocab),
                    emb_size=500, hidden_size=500,
                    num_layers=2, dropout=0.5)
-dev_perplexities = train(model, num_epochs=60, print_every=500)
+#dev_perplexities = train(model, num_epochs=60, print_every=500)
 torch.save(model, "20_epochs.pt")
 
 
