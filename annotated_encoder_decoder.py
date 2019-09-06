@@ -374,14 +374,12 @@ class Batch:
                 self.trg = self.trg.cuda()
                 self.trg_y = self.trg_y.cuda()
                 self.trg_mask = self.trg_mask.cuda()
-                
-
 
 # ## Training Loop
 # The code below trains the model for 1 epoch (=1 pass through the training data).
 
 
-def run_epoch(data_iter, model, loss_compute, print_every=50):
+def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0):
     """Standard Training and Logging Function"""
 
     start = time.time()
@@ -406,27 +404,10 @@ def run_epoch(data_iter, model, loss_compute, print_every=50):
             start = time.time()
             print_tokens = 0
 
+        if num_batches > 0 and i > num_batches:
+            break
+
     return math.exp(total_loss / float(total_tokens))
-
-
-# ## Training Data and Batching
-# 
-# We will use torch text for batching. This is discussed in more detail below. 
-
-# ## Optimizer
-# 
-# We will use the [Adam optimizer](https://arxiv.org/abs/1412.6980) with default settings ($\beta_1=0.9$, $\beta_2=0.999$ and $\epsilon=10^{-8}$).
-# 
-# We will use $0.0003$ as the learning rate here, but for different problems another learning rate may be more appropriate. You will have to tune that.
-
-# # A First  Example
-# 
-# We can begin by trying out a simple copy-task. Given a random set of input symbols from a small vocabulary, the goal is to generate back those same symbols. 
-
-# ## Synthetic Data
-
-
-# ## Loss Computation
 
 class SimpleLossCompute:
     """A simple loss compute and train function."""
@@ -438,8 +419,15 @@ class SimpleLossCompute:
 
     def __call__(self, x, y, norm):
         x = self.generator(x)
+
+        #print("czw x", x.contiguous().view(-1, x.size(-1)).size())
+        #print("czw y", y.contiguous().view(-1).size())
+        #x.view(-1,x.size(-1)) creates a block that is (n_seq*seq_leq, dim)
+        #y.view creates a 1D list of indices
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               y.contiguous().view(-1))
+        print("czw x", x.view(-1, x.size(-1)))
+        print("czw y", y.view(-1))
         loss = loss / norm
 
         if self.opt is not None:
@@ -449,59 +437,6 @@ class SimpleLossCompute:
 
         return loss.data.item() * norm
 
-
-# ### Printing examples
-# 
-# To monitor progress during training, we will translate a few examples.
-# 
-# We use greedy decoding for simplicity; that is, at each time step, starting at the first token, we choose the one with that maximum probability, and we never revisit that choice. 
-
-def greedy_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None):
-    """Greedily decode a sentence."""
-
-    with torch.no_grad():
-        encoder_hidden, encoder_final = model.encode(src, src_mask, src_lengths)
-        prev_y = torch.ones(1, 1).fill_(sos_index).type_as(src)
-        trg_mask = torch.ones_like(prev_y)
-
-    output = []
-    attention_scores = []
-    hidden = None
-
-    for i in range(max_len):
-        with torch.no_grad():
-            out, hidden, pre_output = model.decode(
-              encoder_hidden, encoder_final, src_mask,
-              prev_y, trg_mask, hidden)
-
-            # we predict from the pre-output layer, which is
-            # a combination of Decoder state, prev emb, and context
-            prob = model.generator(pre_output[:, -1])
-
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.data.item()
-        output.append(next_word)
-        prev_y = torch.ones(1, 1).type_as(src).fill_(next_word)
-        attention_scores.append(model.decoder.attention.alphas.cpu().numpy())
-    
-    output = np.array(output)
-        
-    # cut off everything starting from </s> 
-    # (only when eos_index provided)
-    if eos_index is not None:
-        first_eos = np.where(output==eos_index)[0]
-        if len(first_eos) > 0:
-            output = output[:first_eos[0]]      
-    
-    return output, np.concatenate(attention_scores, axis=1)
- 
-class BeamNode():
-    def __init__(self, prev_input, prev_h, logProb, words=[], attentionScores=[]):
-        self.words = words
-        self.prev_input = prev_input
-        self.prev_h = prev_h
-        self.logProb = logProb
-        self.attentionScores = attentionScores
 
 def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None, beam_size=5):
     """Greedily decode a sentence."""
@@ -518,6 +453,7 @@ def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos
     beam_nodes.append(BeamNode(sos_index, hidden, 0))
     ended = False
     while i<max_len and not ended:
+        new_nodes = []
         for node in beam_nodes:
             prev_word = node.prev_input
             prev_y = torch.ones(1, 1).fill_(prev_word).type_as(src)
@@ -532,27 +468,48 @@ def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos
                 # a combination of Decoder state, prev emb, and context
                 prob = model.generator(pre_output[:, -1])
 
-            probs, words = torch.topk(prob, beam_size,  dim=1)
-            for prob, word in zip(probs, words):
-                next_word = next_word.data.item()
-                new_words = node.words.copy().append(next_word)
-                new_prob = node.logProb + prob
-                new_node = BeamNode(next_word, hidden, new_prob, words=new_words)
+            probs, words = torch.topk(prob, beam_size, dim=1)
+            #print(probs, words)
+            probs = probs.squeeze().cpu().numpy()
+            words = words.squeeze().cpu().numpy()
+            #print([lookup_words(x, TRG.vocab) for x in words])
+#            print(lookup_words(words, TRG.vocab))
+            #print(probs)
+            #print(words)
+            for j in range(len(probs)):
+                #print(j)
+                probj = probs[j]
+                next_word = words[j]
+                #print(probi)
+                #print(wordi)
+                new_words = node.words.copy() + [next_word]
+                new_prob = node.logProb + probj
+                new_node = BeamNode(next_word, hidden, new_prob, words=new_words, attention_scores=node.attention_scores.copy())
                 new_node.attention_scores.append(model.decoder.attention.alphas.cpu().numpy())
-                beam_nodes.append(new_node)
-            i+=1
-        beam_nodes = sorted(beam_nodes, key=lambda node: -node.logProb)[:beam_size] 
-        ended = bool(sum([1 if node.prev_input==eos_token else 0 for node in beam_nodes]))
+                new_nodes.append(new_node)
+        i+=1
+        #print("first", len(beam_nodes))
+        beam_nodes = sorted(new_nodes, key=lambda node: -node.logProb)[:beam_size] 
+        #print(lookup_words([n.prev_input for n in beam_nodes], TRG.vocab))
+        #print([n.logProb for n in beam_nodes])
+        #print([n.logProb for n in beam_nodes])
+        #print(len(beam_nodes))
+        ended = any([True if node.prev_input==eos_index else False for node in beam_nodes])
+        #print(ended)
     output = []
     attns = []
     if ended:
-        end_node_i = [1 if node.prev_input==eos_token else 0 for node in beam_nodes].index(1)
+        end_node_i = [1 if node.prev_input==eos_index else 0 for node in beam_nodes].index(1)
         end_node = beam_nodes[end_node_i]
+        output = np.array(end_node.words[:-1])
     else:
         end_node = beam_nodes[0]
-    output = np.array(end_node.words)
-    
-    return output, np.concatenate(end_node.attentionScores, axis=1)
+        output = np.array(end_node.words)
+    #print(end_node.attention_scores) 
+    #print(np.array(end_node.attention_scores).shape) 
+    #print([x.shape for x in end_node.attention_scores])
+    #print(output)
+    return output, np.concatenate(np.array(end_node.attention_scores), axis=1)
   
 
 def lookup_words(x, vocab=None):
@@ -591,7 +548,7 @@ def print_examples(example_iter, model, n=2, max_len=100,
         src = src[:-1] if src[-1] == src_eos_index else src
         trg = trg[:-1] if trg[-1] == trg_eos_index else trg      
       
-        result, _ = greedy_decode(
+        result, _ = beam_decode(
           model, batch.src, batch.src_mask, batch.src_lengths,
           max_len=max_len, sos_index=trg_sos_index, eos_index=trg_eos_index)
         print("Example #%d" % (i+1))
@@ -629,26 +586,10 @@ SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
 TRG = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
                  unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
 
-MAX_LEN = 100  # NOTE: we filter out a lot of sentences for speed
-my_data = {}
-
-for split in ["train", "val", "test"]:
-    my_data[split] = datasets.TranslationDataset(path="data/"+split,
-                    exts=('.nl', '.amr'), fields=(SRC, TRG), 
-                    filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and 
-                        len(vars(x)['trg']) <= MAX_LEN)
-MIN_FREQ = 5  # NOTE: we limit the vocabulary to frequent words for speed
-SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
-TRG.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
-
-PAD_INDEX = TRG.vocab.stoi[PAD_TOKEN]
-
-
+#MAX_LEN = 100  # NOTE: we filter out a lot of sentences for speed
 # ### Let's look at the data
 # 
 # It never hurts to look at your data and some statistics.
-
-# In[19]:
 
 
 def print_data_info(my_data, src_field, trg_field):
@@ -682,27 +623,6 @@ def print_data_info(my_data, src_field, trg_field):
     print("Number of AMR words (types):", len(trg_field.vocab), "\n")
     
     
-print_data_info(my_data, SRC, TRG)
-
-
-# ## Iterators
-# Batching matters a ton for speed. We will use torch text's BucketIterator here to get batches containing sentences of (almost) the same length.
-# 
-# #### Note on sorting batches for RNNs in PyTorch
-# 
-# For effiency reasons, PyTorch RNNs require that batches have been sorted by length, with the longest sentence in the batch first. For training, we simply sort each batch. 
-# For validation, we would run into trouble if we want to compare our translations with some external file that was not sorted. Therefore we simply set the validation batch size to 1, so that we can keep it in the original order.
-
-
-train_iter = data.BucketIterator(my_data["train"], batch_size=100, train=True, 
-                                 sort_within_batch=True, 
-                                 sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
-                                 device=DEVICE)
-
-valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
-
-test_iter = data.Iterator(my_data["test"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
-
 
 def rebatch(pad_idx, batch):
     """Wrap torchtext batch into our own Batch class for pre-processing"""
@@ -715,7 +635,7 @@ def rebatch(pad_idx, batch):
 # 
 # On a Titan X GPU, this runs at ~18,000 tokens per second with a batch size of 64.
 
-def train(model, num_epochs=10, lr=0.0003, print_every=100):
+def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0):
     """Train a model on IWSLT"""
     
     if USE_CUDA:
@@ -735,7 +655,8 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100):
         train_perplexity = run_epoch((rebatch(PAD_INDEX, b) for b in train_iter), 
                                      model,
                                      SimpleLossCompute(model.generator, criterion, optim),
-                                     print_every=print_every)
+                                     print_every=print_every,
+                                     num_batches=num_batches)
         
         model.eval()
         with torch.no_grad():
@@ -755,117 +676,62 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100):
     return dev_perplexities
         
 
-model = make_model(len(SRC.vocab), len(TRG.vocab),
-                   emb_size=500, hidden_size=500,
-                   num_layers=2, dropout=0.5)
-#dev_perplexities = train(model, num_epochs=60, print_every=500)
-torch.save(model, "20_epochs.pt")
-
-
-plot_perplexity(dev_perplexities)
-
-
-# ## Prediction and Evaluation
-# 
-# Once trained we can use the model to produce a set of translations. 
-# 
-# If we translate the whole validation set, we can use [SacreBLEU](https://github.com/mjpost/sacreBLEU) to get a [BLEU score](https://en.wikipedia.org/wiki/BLEU), which is the most common way to evaluate translations.
-# 
-# #### Important sidenote
-# Typically you would use SacreBLEU from the **command line** using the output file and original (possibly tokenized) development reference file. This will give you a nice version string that shows how the BLEU score was calculated; for example, if it was lowercased, if it was tokenized (and how), and what smoothing was used. If you want to learn more about how BLEU scores are (and should be) reported, check out [this paper](https://arxiv.org/abs/1804.08771).
-# 
-# However, right now our pre-processed data is only in memory, so we'll calculate the BLEU score right from this notebook for demonstration purposes.
-# 
-# We'll first test the raw BLEU function:
-
 
 import sacrebleu
 
-# this should result in a perfect BLEU of 100%
-hypotheses = ["this is a test"]
-references = ["this is a test"]
-bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
-print(bleu)
+def eval_val(file_name, model, valid_iter, targ_field, datasets):
+    references = [" ".join(example.trg) for example in datasets["val"]]
 
+    hypotheses = []
+    alphas = []  # save the last attention scores
+    for batch in tqdm(valid_iter):
+      batch = rebatch(PAD_INDEX, batch)
+      pred, attention = beam_decode(
+        model, batch.src, batch.src_mask, batch.src_lengths,
+        sos_index=targ_field.vocab.stoi[SOS_TOKEN],
+        eos_index=targ_field.vocab.stoi[EOS_TOKEN])
+      hypotheses.append(pred)
+      alphas.append(attention)
 
-# here the BLEU score will be lower, because some n-grams won't match
-hypotheses = ["this is a test"]
-references = ["this is a fest"]
-bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
-print(bleu)
+    hypotheses = [lookup_words(x, TRG.vocab) for x in hypotheses]
+    hypotheses = [" ".join(x) for x in hypotheses]
 
+    with open(file_name, "w") as file:
+        for line in hypotheses:
+            file.write(line+"\n")
 
-# Since we did some filtering for speed, our validation set contains 690 sentences.
-# The references are the tokenized versions, but they should not contain out-of-vocabulary UNKs that our network might have seen. So we'll take the references straight out of the `valid_data` object:
+    bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
+    print(bleu)
 
+for num_batches in [100]:
+    my_data = {}
 
-len(my_data["val"])
+    for split in ["train", "val", "test"]:
+        my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
+                        exts=('.nl', '.amr'), fields=(SRC, TRG))
+                        #filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and 
+                        #    len(vars(x)['trg']) <= MAX_LEN)
+    MIN_FREQ = 5  # NOTE: we limit the vocabulary to frequent words for speed
+    SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
+    TRG.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
 
+    PAD_INDEX = TRG.vocab.stoi[PAD_TOKEN]
 
-# In[28]:
+    print_data_info(my_data, SRC, TRG)
+    train_iter = data.BucketIterator(my_data["train"], batch_size=100, train=True, 
+                                     sort_within_batch=True, 
+                                     sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
+                                     device=DEVICE)
 
+    valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
 
-references = [" ".join(example.trg) for example in my_data["val"]]
-print(len(references))
-print(references[0])
-
-
-# In[29]:
-
-
-references[-2]
-
-
-# **Now we translate the validation set!**
-# 
-# This might take a little bit of time.
-# 
-# Note that `greedy_decode` will cut-off the sentence when it encounters the end-of-sequence symbol, if we provide it the index of that symbol.
-
-# In[30]:
-
-
-hypotheses = []
-alphas = []  # save the last attention scores
-for batch in valid_iter:
-  batch = rebatch(PAD_INDEX, batch)
-  pred, attention = greedy_decode(
-    model, batch.src, batch.src_mask, batch.src_lengths, max_len=MAX_LEN,
-    sos_index=TRG.vocab.stoi[SOS_TOKEN],
-    eos_index=TRG.vocab.stoi[EOS_TOKEN])
-  hypotheses.append(pred)
-  alphas.append(attention)
-
-
-# In[31]:
-
-
-# we will still need to convert the indices to actual words!
-hypotheses[0]
-
-
-# In[32]:
-
-
-hypotheses = [lookup_words(x, TRG.vocab) for x in hypotheses]
-hypotheses[0]
-
-
-
-# finally, the SacreBLEU raw scorer requires string input, so we convert the lists to strings
-hypotheses = [" ".join(x) for x in hypotheses]
-print(len(hypotheses))
-print(hypotheses[0])
-
-with open("val.pred", "w") as file:
-    for line in hypotheses:
-        file.write(line+"\n\n")
-
-
-# now we can compute the BLEU score!
-bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
-print(bleu)
-
+    model = make_model(len(SRC.vocab), len(TRG.vocab),
+                       emb_size=500, hidden_size=500,
+                       num_layers=2, dropout=0.5)
+    dev_perplexities = train(model, num_epochs=60, print_every=500, num_batches=num_batches)
+    torch.save(model, str(num_batches) + ".pt")
+    file_name = str(num_batches) + "_batches.pred"
+    eval_val(file_name, model, valid_iter, TRG, my_data)
 
 # ## Attention Visualization
 # 
@@ -893,12 +759,12 @@ def plot_heatmap(src, trg, scores):
 
 
 # This plots a chosen sentence, for which we saved the attention scores above.
-idx = 5
-src = my_data["val"][idx].src + ["</s>"]
-trg = my_data["val"][idx].trg + ["</s>"]
-pred = hypotheses[idx].split() + ["</s>"]
-pred_att = alphas[idx][0].T[:, :len(pred)]
-print("src", src)
-print("ref", trg)
-print("pred", pred)
-plot_heatmap(src, pred, pred_att)
+#idx = 5
+#src = my_data["val"][idx].src + ["</s>"]
+#trg = my_data["val"][idx].trg + ["</s>"]
+#pred = hypotheses[idx].split() + ["</s>"]
+#pred_att = alphas[idx][0].T[:, :len(pred)]
+#print("src", src)
+#print("ref", trg)
+#print("pred", pred)
+#plot_heatmap(src, pred, pred_att)
