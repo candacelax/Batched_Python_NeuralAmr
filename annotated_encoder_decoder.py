@@ -409,6 +409,25 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0):
 
     return math.exp(total_loss / float(total_tokens))
 
+class OracleCriterion:
+    
+    def __init__(self, pad_index):
+        self.pad_index = pad_index
+
+    def __call__(self, x, y):
+        #x is a list of (vocab_size) vectors in batches. ((batch*seq_length) x vocab_size)
+        #y is a list of indicies into a vocab_size vector (batch*seq_length)
+        mask = y.ne(self.pad_index) # this is a mask that is the shape of a 1D list 
+        #print("czw, x.size()", x.size())
+        #print("czw mask.size()", mask.size())
+        #print("czw x[torch.arange(x.size(0)), y]", x[torch.arange(x.size(0)),y].size())
+        probs = x[torch.arange(x.size(0)), y] #index select
+        masked_probs = torch.masked_select(probs, mask)
+        loss = -1*torch.sum(masked_probs)
+        #print("czw loss", loss)
+        return loss
+        
+
 class SimpleLossCompute:
     """A simple loss compute and train function."""
 
@@ -422,12 +441,15 @@ class SimpleLossCompute:
 
         #print("czw x", x.contiguous().view(-1, x.size(-1)).size())
         #print("czw y", y.contiguous().view(-1).size())
-        #x.view(-1,x.size(-1)) creates a block that is (n_seq*seq_leq, dim)
+        #x.view(-1,x.size(-1)) creates a block that is (n_seq*seq_leq, vocab_size)
         #y.view creates a 1D list of indices
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               y.contiguous().view(-1))
-        print("czw x", x.view(-1, x.size(-1)))
-        print("czw y", y.view(-1))
+        #use the below for NLLLoss()
+        #loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
+        #                      y.contiguous().view(-1))
+        #print("czw x", x.view(-1, x.size(-1)))
+        #print("czw y", y.contiguous().view(-1))
         loss = loss / norm
 
         if self.opt is not None:
@@ -437,6 +459,13 @@ class SimpleLossCompute:
 
         return loss.data.item() * norm
 
+class BeamNode():
+    def __init__(self, prev_input, prev_h, logProb, words=[], attention_scores=[]):
+        self.words = words
+        self.prev_input = prev_input
+        self.prev_h = prev_h
+        self.logProb = logProb
+        self.attention_scores = attention_scores
 
 def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None, beam_size=5):
     """Greedily decode a sentence."""
@@ -642,7 +671,8 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0):
         model.cuda()
 
     # optionally add label smoothing; see the Annotated Transformer
-    criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
+    #criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
+    criterion = OracleCriterion(PAD_INDEX)
     optim = torch.optim.Adam(model.parameters(), lr=lr)
     
     dev_perplexities = []
