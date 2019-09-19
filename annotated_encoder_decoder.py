@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -337,9 +337,43 @@ def make_model(src_vocab, tgt_vocab, emb_size=256, hidden_size=512, num_layers=1
 # needed to train a standard encoder decoder model. First we define a batch object that holds the src and target sentences for training, as well as their lengths and masks. 
 
 # ## Batches and Masking
-
-
 class Batch:
+    """Object for holding a batch of data with mask during training.
+    Input is a batch from a torch text iterator.
+    """
+    def __init__(self, src, trg, pad_index=0):
+        
+        src, src_lengths = src
+        
+        self.src = src
+        self.src_lengths = src_lengths
+        self.src_mask = (src != pad_index).unsqueeze(-2)
+        self.nseqs = src.size(0)
+        
+        self.trg = None
+        self.trg_y = None
+        self.trg_mask = None
+        self.trg_lengths = None
+        self.ntokens = None
+
+        if trg is not None:
+            trg, trg_lengths = trg
+            self.trg = trg[:, :-1]
+            self.trg_lengths = trg_lengths
+            self.trg_y = trg[:, 1:]
+            self.trg_mask = (self.trg_y != pad_index)
+            self.ntokens = (self.trg_y != pad_index).data.sum().item()
+        
+        if USE_CUDA:
+            self.src = self.src.cuda()
+            self.src_mask = self.src_mask.cuda()
+
+            if trg is not None:
+                self.trg = self.trg.cuda()
+                self.trg_y = self.trg_y.cuda()
+                self.trg_mask = self.trg_mask.cuda()
+
+class CorruptedBatch:
     """Object for holding a batch of data with mask during training.
     Input is a batch from a torch text iterator.
     """
@@ -378,8 +412,7 @@ class Batch:
 # ## Training Loop
 # The code below trains the model for 1 epoch (=1 pass through the training data).
 
-
-def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0):
+def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0, phase="train", epoch_num=0):
     """Standard Training and Logging Function"""
 
     start = time.time()
@@ -388,11 +421,11 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0):
     print_tokens = 0
 
     for i, batch in tqdm(enumerate(data_iter, 1)):
-        
         out, _, pre_output = model.forward(batch.src, batch.trg,
                                            batch.src_mask, batch.trg_mask,
                                            batch.src_lengths, batch.trg_lengths)
         loss = loss_compute(pre_output, batch.trg_y, batch.nseqs)
+        #print(f'epoch loss {loss}')
         total_loss += loss
         total_tokens += batch.ntokens
         print_tokens += batch.ntokens
@@ -407,8 +440,49 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0):
         if num_batches > 0 and i > num_batches:
             break
 
-    return math.exp(total_loss / float(total_tokens))
+    return math.exp(total_loss / float(total_tokens)), total_loss
+    #return total_loss / float(total_tokens)
 
+class myNLL:
+    def __init__(self, pad_index):
+        self.pad_index = pad_index
+
+    def __call__(self, x, y):
+        #x is a list of (vocab_size) vectors in batches. ((batch*seq_length) x vocab_size)
+        #y is a list of indicies into a vocab_size vector (batch*seq_length)
+        mask = y.ne(self.pad_index) # this is a mask that is the shape of a 1D list 
+        #print("czw, x.size()", x.size())
+        #print("czw mask.size()", mask.size())
+        #print("czw x[torch.arange(x.size(0)), y]", x[torch.arange(x.size(0)),y].size())
+        probs = x[torch.arange(x.size(0)), y] #index select
+        #print("czw probs", probs)
+        #print("czw probs size", probs.size())
+        masked_probs = torch.masked_select(probs, mask)
+        loss = -torch.sum(masked_probs)#sum for log prob
+        #print("czw loss", loss)
+        return loss
+
+class PermissiveCriterion:
+    
+    def __init__(self, pad_index):
+        self.pad_index = pad_index
+
+    def __call__(self, x, y):
+        #x is batch x seq_len x vocab_size
+        #y is batch x seq_len
+        mask = y.ne(self.pad_index)
+        batch_len = y.size(0)
+        flat_x = x.view(-1, x.size(-1))
+        flat_y = y.view(-1)
+        probs = flat_x[torch.arange(flat_x.size(0)), flat_y]
+        probs = probs.view(batch_len, -1)
+        losses = torch.zeros(batch_len)
+        for i in range(probs.size(0)):
+            losses[i] = 1 - torch.exp(torch.max(torch.masked_select(probs[i], mask[i])))
+        #print("loss", torch.sum(losses))
+        return torch.sum(losses)
+            
+       
 class OracleCriterion:
     
     def __init__(self, pad_index):
@@ -421,12 +495,119 @@ class OracleCriterion:
         #print("czw, x.size()", x.size())
         #print("czw mask.size()", mask.size())
         #print("czw x[torch.arange(x.size(0)), y]", x[torch.arange(x.size(0)),y].size())
-        probs = x[torch.arange(x.size(0)), y] #index select
+        probs = torch.exp(x[torch.arange(x.size(0)), y]) #index select
+        #print("czw probs", probs)
+        #print("czw probs size", probs.size())
         masked_probs = torch.masked_select(probs, mask)
-        loss = -1*torch.sum(masked_probs)
+        loss = 1-torch.prod(masked_probs)#sum for log prob
         #print("czw loss", loss)
         return loss
-        
+
+class TokenNoiseLossCompute:
+    """A simple loss compute and train function."""
+
+    def __init__(self, generator, criterion, error_per, trg_vocab_size, pad_index,opt=None):
+        self.generator = generator
+        self.criterion = criterion
+        self.error_per = error_per
+        self.opt = opt
+        self.trg_vocab_size = trg_vocab_size
+        self.pad_index = pad_index
+
+    def __call__(self, x, y, norm):
+        x = self.generator(x)
+        np_y = y.contiguous().view(-1).detach().cpu().numpy()
+        new_y = [
+                    np.random.randint(1+self.pad_index, self.trg_vocab_size)
+                    if random.random() < self.error_per and x != self.pad_index
+                    else x
+                    for x in np_y
+                ]
+        new_y = torch.Tensor(new_y).type_as(y)
+        loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
+                              new_y.contiguous().view(-1))
+        loss = loss / norm
+
+        if self.opt is not None:
+            loss.backward()          
+            self.opt.step()
+            self.opt.zero_grad()
+
+        return loss.data.item() * norm
+ 
+class NoisyLossCompute:
+    """A simple loss compute and train function."""
+
+    def __init__(self, generator, criterion, error_per, trg_vocab_size, pad_index,opt=None):
+        self.generator = generator
+        self.criterion = criterion
+        self.error_per = error_per
+        self.opt = opt
+        self.trg_vocab_size = trg_vocab_size
+        self.pad_index = pad_index
+
+    def __call__(self, x, y, norm):
+        #y is (n_seq, seq_len)
+        #print(x.size(), y.size())
+        x = self.generator(x)
+        new_y = torch.ones_like(y)
+        #count1 = 0
+        #count2 = 0
+        for i in range(y.size(0)):#iterate over the seqs in a batch
+            if random.random() < self.error_per:
+                rand_size = np.random.randint(y.size(1)-1)
+                random_targ = np.zeros(y.size(1)).astype(int)
+                random_targ.fill(self.pad_index)
+                #random_targ.fill(18)
+                random_targ[:rand_size] = np.random.randint(self.pad_index+1, self.trg_vocab_size, size=rand_size)
+                #rand_words = lookup_words(random_targ, TRG.vocab)
+                #rand_words = " ".join(rand_words)
+                #print(rand_words)
+ 
+         #       count1 += 1
+                new_y[i] = torch.Tensor(random_targ).type_as(y)
+                #print(new_y[i])
+            else:
+         #       count2 += 1
+                new_y[i] = y[i]
+        #print(count1, count2)
+        #x.view(-1,x.size(-1)) creates a block that is (n_seq*seq_leq, vocab_size)
+        #y.view creates a 1D list of indices
+        loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
+                              new_y.contiguous().view(-1))
+        loss = loss / norm
+
+        if self.opt is not None:
+            loss.backward()          
+            self.opt.step()
+            self.opt.zero_grad()
+
+        return loss.data.item() * norm
+ 
+class PermissiveLossCompute:
+    """A simple loss compute and train function."""
+
+    def __init__(self, generator, criterion, opt=None):
+        self.generator = generator
+        self.criterion = criterion
+        self.opt = opt
+
+    def __call__(self, x, y, norm):
+        #x is n_seq x seq_len x vocab_size
+        #y is n_seq * seq_len
+        x = self.generator(x)
+
+        loss = self.criterion(x.contiguous(),
+                              y.contiguous())
+        loss = loss / norm
+
+        if self.opt is not None:
+            loss.backward()          
+            self.opt.step()
+            self.opt.zero_grad()
+
+        return loss.data.item() * norm
+
 
 class SimpleLossCompute:
     """A simple loss compute and train function."""
@@ -664,39 +845,55 @@ def rebatch(pad_idx, batch):
 # 
 # On a Titan X GPU, this runs at ~18,000 tokens per second with a batch size of 64.
 
-def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0):
+def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error_per=0):
     """Train a model on IWSLT"""
     
     if USE_CUDA:
         model.cuda()
 
     # optionally add label smoothing; see the Annotated Transformer
-    #criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
-    criterion = OracleCriterion(PAD_INDEX)
+    criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
+    #criterion = OracleCriterion(PAD_INDEX)
+    #criterion = PermissiveCriterion(PAD_INDEX)
+    #criterion = myNLL(PAD_INDEX)
     optim = torch.optim.Adam(model.parameters(), lr=lr)
     
     dev_perplexities = []
-    min_perplexity = 1000
+    min_perplexity = float('inf')
 
     for epoch in range(num_epochs):
       
         print("Epoch", epoch)
         model.train()
-        train_perplexity = run_epoch((rebatch(PAD_INDEX, b) for b in train_iter), 
+        train_perplexity, train_loss = run_epoch((rebatch(PAD_INDEX, b) for b in train_iter), 
                                      model,
                                      SimpleLossCompute(model.generator, criterion, optim),
+                                     #TokenNoiseLossCompute(model.generator, criterion, error_per, len(TRG.vocab), PAD_INDEX, optim),
+                                     #NoisyLossCompute(model.generator, criterion, error_per, len(TRG.vocab), PAD_INDEX, optim),
+                                     #PermissiveLossCompute(model.generator, criterion, optim),
                                      print_every=print_every,
-                                     num_batches=num_batches)
+                                     num_batches=num_batches,
+                                     phase="train")
         
+        print("train loss", train_loss)
+        writer.add_scalar("train loss", train_loss, epoch)
         model.eval()
         with torch.no_grad():
+            print("val examples")
             print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
                            model, n=3, src_vocab=SRC.vocab, trg_vocab=TRG.vocab)        
 
-            dev_perplexity = run_epoch((rebatch(PAD_INDEX, b) for b in valid_iter), 
+            #print("train examples")
+            #print_examples((rebatch(PAD_INDEX, x) for x in train_iter), 
+            #               model, n=3, src_vocab=SRC.vocab, trg_vocab=TRG.vocab)        
+
+            dev_perplexity, val_loss = run_epoch((rebatch(PAD_INDEX, b) for b in valid_iter), 
                                        model, 
-                                       SimpleLossCompute(model.generator, criterion, None))
+                                       SimpleLossCompute(model.generator, criterion, None), 
+                                       phase="val")
+            writer.add_scalar("val loss", val_loss, epoch)
             print("Validation perplexity: %f" % dev_perplexity)
+            print("val loss", val_loss)
             dev_perplexities.append(dev_perplexity)
             if dev_perplexity < min_perplexity:
                 torch.save(model, "best_model.pt")
@@ -714,7 +911,7 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
 
     hypotheses = []
     alphas = []  # save the last attention scores
-    for batch in tqdm(valid_iter):
+    for batch in valid_iter:
       batch = rebatch(PAD_INDEX, batch)
       pred, attention = beam_decode(
         model, batch.src, batch.src_mask, batch.src_lengths,
@@ -733,12 +930,14 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
     bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
     print(bleu)
 
-for num_batches in [100]:
+for error in range(1,2):
     my_data = {}
+    num_batches=100
+    error_per = error/10. 
 
     for split in ["train", "val", "test"]:
         my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
-                        exts=('.nl', '.amr'), fields=(SRC, TRG))
+                        exts=('.amr', '.nl'), fields=(SRC, TRG))
                         #filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and 
                         #    len(vars(x)['trg']) <= MAX_LEN)
     MIN_FREQ = 5  # NOTE: we limit the vocabulary to frequent words for speed
@@ -758,11 +957,14 @@ for num_batches in [100]:
     model = make_model(len(SRC.vocab), len(TRG.vocab),
                        emb_size=500, hidden_size=500,
                        num_layers=2, dropout=0.5)
-    dev_perplexities = train(model, num_epochs=60, print_every=500, num_batches=num_batches)
-    torch.save(model, str(num_batches) + ".pt")
-    file_name = str(num_batches) + "_batches.pred"
+    dev_perplexities = train(model, num_epochs=60, print_every=500, num_batches=num_batches, error_per=error_per)
+    #torch.save(model, str(error_per) + "_permissive.pt")
+    torch.save(model, "reverse.pt")
+    file_name = "reverse.pred"
+    print(file_name)
     eval_val(file_name, model, valid_iter, TRG, my_data)
 
+writer.close()
 # ## Attention Visualization
 # 
 # We can also visualize the attention scores of the decoder.
