@@ -11,6 +11,10 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from tensorboardX import SummaryWriter
 from tqdm import tqdm as tqdm
 
+from torchtext import data, datasets
+
+import spacy
+
 USE_CUDA = torch.cuda.is_available()
 DEVICE=torch.device('cuda:0') # or set to 'cpu'
 print("CUDA:", USE_CUDA)
@@ -22,12 +26,6 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
 writer = SummaryWriter()
-
-# ## Model class
-# 
-# Our base model class `EncoderDecoder` is very similar to the one in *The Annotated Transformer*.
-# 
-# One difference is that our encoder also returns its final states (`encoder_final` below), which is used to initialize the decoder RNN. We also provide the sequence lengths as the RNNs require those.
 
 class EncoderDecoder(nn.Module):
     """
@@ -58,7 +56,6 @@ class EncoderDecoder(nn.Module):
 
 # To keep things easy we also keep the `Generator` class the same. 
 # It simply projects the pre-output layer ($x$ in the `forward` function below) to obtain the output layer, so that the final dimension is the target vocabulary size.
-
 class Generator(nn.Module):
     """Define standard linear + softmax generation step."""
     def __init__(self, hidden_size, vocab_size):
@@ -66,6 +63,9 @@ class Generator(nn.Module):
         self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, x):
+        """
+            In most cases, x is (batch_len x seq_len x hidden_size)
+        """
         return F.log_softmax(self.proj(x), dim=-1)
 
 
@@ -74,27 +74,6 @@ class Generator(nn.Module):
 # Our encoder is a bi-directional LSTM. 
 # 
 # Because we want to process multiple sentences at the same time for speed reasons (it is more effcient on GPU), we need to support **mini-batches**. Sentences in a mini-batch may have different lengths, which means that the RNN needs to unroll further for certain sentences while it might already have finished for others:
-# 
-# ```
-# Example: mini-batch with 3 source sentences of different lengths (7, 5, and 3).
-# End-of-sequence is marked with a "3" here, and padding positions with "1".
-# 
-# +---------------+
-# | 4 5 9 8 7 8 3 |
-# +---------------+
-# | 5 4 8 7 3 1 1 |
-# +---------------+
-# | 5 8 3 1 1 1 1 |
-# +---------------+
-# ```
-# You can see that, when computing hidden states for this mini-batch, for sentence #2 and #3 we will need to stop updating the hidden state after we have encountered "3". We don't want to incorporate the padding values (1s).
-# 
-# Luckily, PyTorch has convenient helper functions called `pack_padded_sequence` and `pad_packed_sequence`.
-# These functions take care of masking and padding, so that the resulting word representations are simply zeros after a sentence stops.
-# 
-# The code below reads in a source sentence (a sequence of word embeddings) and produces the hidden states.
-# It also returns a final vector, a summary of the complete sentence, by concatenating the first and the last hidden states (they have both seen the whole sentence, each in a different direction). We will use the final vector to initialize the decoder.
-
 class Encoder(nn.Module):
     """Encodes a sequence of word embeddings"""
     def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.):
@@ -112,26 +91,19 @@ class Encoder(nn.Module):
         packed = pack_padded_sequence(x, lengths, batch_first=True)
         output, final = self.rnn(packed)
         output, _ = pad_packed_sequence(output, batch_first=True)
-        
         # output is of size (batch_length, seq_length, num_directions*hidden_size)
-        # final[0] is of size (num_layers*num_directions, batch_length, hidden_size)
-        # final[0][0] is fwd for first layer. final[0][2] is forward for second layer.
 
         # we need to manually concatenate the final states for both directions
         # final is a tuple of (hidden, cell)
-        #print("output")
-        #print(output.size())
-        #print("final size")
-        #print(final[0].size())
-        fwd_final_hidden = final[0][0:final[0].size(0):2]
-        #print("final_fwd size")
-        #print(fwd_final_hidden.size())
+        # final[0] is the final hidden state. It has size (num_layers*num_directions, batch_length, hidden_size)
+        # final[0][0] is the fwd direction for first layer. final[0][2] is forward for second layer and so on.
+        fwd_final_hidden = final[0][0:final[0].size(0):2]# [num_layers, batch_len, dim]
         bwd_final_hidden = final[0][1:final[0].size(0):2]
-        final_hidden = torch.cat([fwd_final_hidden, bwd_final_hidden], dim=2)  # [num_layers, batch, 2*dim]
+        final_hidden = torch.cat([fwd_final_hidden, bwd_final_hidden], dim=2)  # [num_layers, batch, num_directions*dim]
 
         fwd_final_cell = final[1][0:final[1].size(0):2]
         bwd_final_cell = final[1][1:final[1].size(0):2]
-        final_cell = torch.cat([fwd_final_cell, bwd_final_cell], dim=2)  # [num_layers, batch, 2*dim]
+        final_cell = torch.cat([fwd_final_cell, bwd_final_cell], dim=2)  # [num_layers, batch, num_directions*dim]
         return output, (final_hidden, final_cell)
 
 
@@ -160,7 +132,8 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.attention = attention
         self.dropout = dropout
-                 
+
+        #the LSTM takes                 
         self.rnn = nn.LSTM(emb_size + 2*hidden_size, hidden_size, num_layers,
                           batch_first=True, dropout=dropout)
                  
@@ -173,7 +146,10 @@ class Decoder(nn.Module):
                                           hidden_size, bias=False)
         
     def forward_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden):
-        """Perform a single decoder step (1 word)"""
+        """Perform a single decoder step (1 word)
+           prev_embed (batch_size x 1 x hidden_size) is the forward hidden state of the previous time step
+           encoder_hidden (batch_size x seq_len x num_directions*hidden_size) is the output of the encoder
+        """
 
         # compute context vector using attention mechanism
         #we only want the hidden, not the cell state of the lstm CZW, hence the hidden[0]
@@ -194,11 +170,21 @@ class Decoder(nn.Module):
     
     def forward(self, trg_embed, encoder_hidden, encoder_final, 
                 src_mask, trg_mask, hidden=None, max_len=None):
-        """Unroll the decoder one step at a time."""
+        """Unroll the decoder one step at a time.
+           trg_embed is (batch_len x trg_max_seq_len x hidden_layer_size)
+           encoder_hidden is (batch_len x src_max_seq_len x num_directions*hidden_layer_size)
+           encoder_final is a tuple of final hidden and final cell state. 
+             each state is (num_layers x batch x num_directions*hidden_layer_size)
+           src_mask is (batch_len x 1 x src_max_seq_len)
+        """
                                          
         # the maximum number of steps to unroll the RNN
+        #print("czw src mask", src_mask.size())
+        #print("czw trg embed", trg_embed.size())
+        #print("czw encoder_hidden", encoder_hidden.size())
+        #print("czw encoder_final", encoder_final[0].size())
         if max_len is None:
-            max_len = trg_mask.size(-1)
+            max_len = trg_embed.size(1)
 
         # initialize decoder hidden state
         if hidden is None:
@@ -373,42 +359,6 @@ class Batch:
                 self.trg_y = self.trg_y.cuda()
                 self.trg_mask = self.trg_mask.cuda()
 
-class CorruptedBatch:
-    """Object for holding a batch of data with mask during training.
-    Input is a batch from a torch text iterator.
-    """
-    def __init__(self, src, trg, pad_index=0):
-        
-        src, src_lengths = src
-        
-        self.src = src
-        self.src_lengths = src_lengths
-        self.src_mask = (src != pad_index).unsqueeze(-2)
-        self.nseqs = src.size(0)
-        
-        self.trg = None
-        self.trg_y = None
-        self.trg_mask = None
-        self.trg_lengths = None
-        self.ntokens = None
-
-        if trg is not None:
-            trg, trg_lengths = trg
-            self.trg = trg[:, :-1]
-            self.trg_lengths = trg_lengths
-            self.trg_y = trg[:, 1:]
-            self.trg_mask = (self.trg_y != pad_index)
-            self.ntokens = (self.trg_y != pad_index).data.sum().item()
-        
-        if USE_CUDA:
-            self.src = self.src.cuda()
-            self.src_mask = self.src_mask.cuda()
-
-            if trg is not None:
-                self.trg = self.trg.cuda()
-                self.trg_y = self.trg_y.cuda()
-                self.trg_mask = self.trg_mask.cuda()
-
 # ## Training Loop
 # The code below trains the model for 1 epoch (=1 pass through the training data).
 
@@ -472,13 +422,27 @@ class PermissiveCriterion:
         #y is batch x seq_len
         mask = y.ne(self.pad_index)
         batch_len = y.size(0)
+        #print("x", x.size())
+        #print("y", y.size())
+        #print("batch_len", batch_len)
         flat_x = x.view(-1, x.size(-1))
         flat_y = y.view(-1)
+        #print("flat_x", flat_x.size())
+        #print("flat_y", flat_y.size())
         probs = flat_x[torch.arange(flat_x.size(0)), flat_y]
+        #print("probs", probs.size())
         probs = probs.view(batch_len, -1)
+        #print("probs", probs.size())
         losses = torch.zeros(batch_len)
         for i in range(probs.size(0)):
-            losses[i] = 1 - torch.exp(torch.max(torch.masked_select(probs[i], mask[i])))
+            #print("max" , torch.masked_select(probs[i], mask[i]))
+            #print("max" , torch.max(torch.masked_select(probs[i], mask[i])))
+            #print("prob" , torch.exp(torch.max(torch.masked_select(probs[i], mask[i]))))
+            if torch.masked_select(probs[i], mask[i]).size(0) < 5:
+                losses[i] = 1 - torch.exp(torch.max(torch.masked_select(probs[i], mask[i])))
+            else:
+                top5, _ = torch.topk(torch.masked_select(probs[i], mask[i]), 5)
+                losses[i] = 5 - torch.sum(torch.exp(top5))
         #print("loss", torch.sum(losses))
         return torch.sum(losses)
             
@@ -657,11 +621,10 @@ def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos
     output = []
     hidden = None
 
-    #for i in range(max_len):
     i = 0
     beam_nodes = []
     beam_nodes.append(BeamNode(sos_index, hidden, 0))
-    ended = False
+    ended = False #Flag raised when EOS token found
     while i<max_len and not ended:
         new_nodes = []
         for node in beam_nodes:
@@ -771,19 +734,6 @@ def print_examples(example_iter, model, n=2, max_len=100,
         if count == n:
             break
 
-# ## Data Loading
-# 
-# We will load the dataset using torchtext and spacy for tokenization.
-# 
-# This cell might take a while to run the first time, as it will download and tokenize the IWSLT data.
-# 
-# For speed we only include short sentences, and we include a word in the vocabulary only if it occurs at least 5 times. In this case we also lowercase the data.
-
-# For data loading.
-from torchtext import data, datasets
-
-import spacy
-
 UNK_TOKEN = "<unk>"
 PAD_TOKEN = "<pad>"    
 SOS_TOKEN = "<s>"
@@ -795,12 +745,6 @@ SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
                  unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=None, eos_token=EOS_TOKEN)
 TRG = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
                  unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
-
-#MAX_LEN = 100  # NOTE: we filter out a lot of sentences for speed
-# ### Let's look at the data
-# 
-# It never hurts to look at your data and some statistics.
-
 
 def print_data_info(my_data, src_field, trg_field):
     """ This prints some useful stuff about our data sets. """
@@ -831,19 +775,10 @@ def print_data_info(my_data, src_field, trg_field):
 
     print("Number of NL words (types):", len(src_field.vocab))
     print("Number of AMR words (types):", len(trg_field.vocab), "\n")
-    
-    
 
 def rebatch(pad_idx, batch):
     """Wrap torchtext batch into our own Batch class for pre-processing"""
     return Batch(batch.src, batch.trg, pad_idx)
-
-
-# ## Training the System
-# 
-# Now we train the model. 
-# 
-# On a Titan X GPU, this runs at ~18,000 tokens per second with a batch size of 64.
 
 def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error_per=0):
     """Train a model on IWSLT"""
@@ -851,10 +786,9 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
     if USE_CUDA:
         model.cuda()
 
-    # optionally add label smoothing; see the Annotated Transformer
     criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
     #criterion = OracleCriterion(PAD_INDEX)
-    #criterion = PermissiveCriterion(PAD_INDEX)
+    criterion = PermissiveCriterion(PAD_INDEX)
     #criterion = myNLL(PAD_INDEX)
     optim = torch.optim.Adam(model.parameters(), lr=lr)
     
@@ -867,10 +801,10 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
         model.train()
         train_perplexity, train_loss = run_epoch((rebatch(PAD_INDEX, b) for b in train_iter), 
                                      model,
-                                     SimpleLossCompute(model.generator, criterion, optim),
+                                     #SimpleLossCompute(model.generator, criterion, optim),
                                      #TokenNoiseLossCompute(model.generator, criterion, error_per, len(TRG.vocab), PAD_INDEX, optim),
                                      #NoisyLossCompute(model.generator, criterion, error_per, len(TRG.vocab), PAD_INDEX, optim),
-                                     #PermissiveLossCompute(model.generator, criterion, optim),
+                                     PermissiveLossCompute(model.generator, criterion, optim),
                                      print_every=print_every,
                                      num_batches=num_batches,
                                      phase="train")
@@ -937,10 +871,8 @@ for error in range(1,2):
 
     for split in ["train", "val", "test"]:
         my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
-                        exts=('.amr', '.nl'), fields=(SRC, TRG))
-                        #filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and 
-                        #    len(vars(x)['trg']) <= MAX_LEN)
-    MIN_FREQ = 5  # NOTE: we limit the vocabulary to frequent words for speed
+                        exts=('.nl', '.amr'), fields=(SRC, TRG))
+    MIN_FREQ = 5
     SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
     TRG.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
 
@@ -957,8 +889,7 @@ for error in range(1,2):
     model = make_model(len(SRC.vocab), len(TRG.vocab),
                        emb_size=500, hidden_size=500,
                        num_layers=2, dropout=0.5)
-    dev_perplexities = train(model, num_epochs=60, print_every=500, num_batches=num_batches, error_per=error_per)
-    #torch.save(model, str(error_per) + "_permissive.pt")
+    dev_perplexities = train(model, num_epochs=15, print_every=500, num_batches=num_batches, error_per=error_per)
     torch.save(model, "reverse.pt")
     file_name = "reverse.pred"
     print(file_name)
