@@ -32,17 +32,17 @@ class Autoencoder(nn.Module):
         super(Autoencoder, self).__init__()
         self.enc_dec_1 = EncoderDecoder1
         self.enc_dec_2 = EncoderDecoder2
-
-    def forward(self, nl_src, amr_src, nl_src_mask, amr_src_mask, nl_src_lengths, amr_src_lengths):
-        """Take in and process masked src and target sequences.
+    
+    def encode(self, nl_src, nl_src_mask, nl_src_lengths, amr_src, amr_src_mask):
+        """
             nl_src is [batch, seq_len] (ends with end token?)
-            amr_src is [batch, seq_len] (begins with start token?)
             nl_src_mask is [batch, 1, seq_len]
-            amr_src_mask is [batch, seq_len]
             nl_src_lengths is [batch]
-            amr_src_lengths is [batch]
+            amr_src is [batch, seq_len] (begins with start token?)
+            amr_src_mask is [batch, seq_len]
         """
         encoder_hidden, encoder_final = self.enc_dec_1.encode(nl_src, nl_src_mask, nl_src_lengths)
+        print("czw encode encoder_hidden", encoder_hidden)
         out, hidden, pre_output = self.enc_dec_1.decode(encoder_hidden, encoder_final, nl_src_mask, amr_src, amr_src_mask)
         #out is [batch, seq_len, hidden_size]
         #pre_output is concat of rnn out, context, and prev_embed
@@ -59,8 +59,25 @@ class Autoencoder(nn.Module):
         print("czw auto inter_src_lengths", inter_lengths.size())
         encoder_hidden, encoder_final = self.enc_dec_2.encode(inter_src, inter_mask, inter_lengths)
         print("czw auto src (as target)" , nl_src.size())
-        out, hidden, pre_output = self.enc_dec_2.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask)
+        return encoder_hidden, encoder_final, inter_mask
+    
+    def decode(self, encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask,
+               decoder_hidden=None):
+        out, hidden, pre_output = self.enc_dec_2.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask, decoder_hidden=decoder_hidden)
         return out, hidden, pre_output
+
+
+    def forward(self, nl_src, amr_src, nl_src_mask, amr_src_mask, nl_src_lengths, amr_src_lengths):
+        """Take in and process masked src and target sequences.
+            nl_src is [batch, seq_len] (ends with end token?)
+            amr_src is [batch, seq_len] (begins with start token?)
+            nl_src_mask is [batch, 1, seq_len]
+            amr_src_mask is [batch, seq_len]
+            nl_src_lengths is [batch]
+            amr_src_lengths is [batch]
+        """
+        encoder_hidden, encoder_final, inter_mask = self.encode(nl_src, nl_src_mask, nl_src_lengths, amr_src, amr_src_mask)
+        return self.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask)
 
 def get_intermediary_batch(src, amr_eos_token):
     """
@@ -109,6 +126,8 @@ class EncoderDecoder(nn.Module):
         return self.decode(encoder_hidden, encoder_final, src_mask, trg, trg_mask)
     
     def encode(self, src, src_mask, src_lengths):
+        print("czw encoderdecoder encode src", src)
+        print("czw encoderdecoder encode src lengths", src_lengths)
         return self.encoder(self.src_embed(src), src_mask, src_lengths)
     
     def decode(self, encoder_hidden, encoder_final, src_mask, trg, trg_mask,
@@ -715,10 +734,13 @@ class BeamNode():
         self.logProb = logProb
         self.attention_scores = attention_scores
 
-def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None, beam_size=5):
+def beam_decode(model, src, src_mask, src_lengths, trg, trg_mask, max_len=100, sos_index=1, eos_index=None, beam_size=5):
+
+    #src is nl
+    #trg is amr
 
     with torch.no_grad():
-        encoder_hidden, encoder_final = model.encode(src, src_mask, src_lengths)
+        encoder_hidden, encoder_final, inter_mask = model.encode(src, src_mask, src_lengths, trg, trg_mask)
 
     output = []
     hidden = None
@@ -731,21 +753,24 @@ def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos
         new_nodes = []
         for node in beam_nodes:
             prev_word = node.prev_input
+            #print('czw prev word', prev_word)
             prev_y = torch.ones(1, 1).fill_(prev_word).type_as(src)
             trg_mask = torch.ones_like(prev_y)
             hidden = node.prev_h
             with torch.no_grad():
                 out, hidden, pre_output = model.decode(
-                  encoder_hidden, encoder_final, src_mask,
+                  encoder_hidden, encoder_final, inter_mask,
                   prev_y, trg_mask, hidden)
 
                 # we predict from the pre-output layer, which is
                 # a combination of Decoder state, prev emb, and context
-                prob = model.generator(pre_output[:, -1])
-
+                prob = model.enc_dec_2.generator(pre_output[:, -1])
+                #print("czw pre_output", pre_output[:,-1])
             probs, words = torch.topk(prob, beam_size, dim=1)
             probs = probs.squeeze().cpu().numpy()
             words = words.squeeze().cpu().numpy()
+            print("czw words", words)
+            print("czw probs", probs)
 
             for j in range(len(probs)):
                 probj = probs[j]
@@ -753,7 +778,7 @@ def beam_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos
                 new_words = node.words.copy() + [next_word]
                 new_prob = node.logProb + probj
                 new_node = BeamNode(next_word, hidden, new_prob, words=new_words, attention_scores=node.attention_scores.copy())
-                new_node.attention_scores.append(model.decoder.attention.alphas.cpu().numpy())
+                new_node.attention_scores.append(model.enc_dec_2.decoder.attention.alphas.cpu().numpy())
                 new_nodes.append(new_node)
         i+=1
         beam_nodes = sorted(new_nodes, key=lambda node: -node.logProb)[:beam_size] 
@@ -796,6 +821,7 @@ def print_examples(example_iter, model, n=2, max_len=100,
     if src_vocab is not None and trg_vocab is not None:
         src_eos_index = src_vocab.stoi[EOS_TOKEN]
         trg_sos_index = trg_vocab.stoi[SOS_TOKEN]
+        src_sos_index = trg_vocab.stoi[SOS_TOKEN]
         trg_eos_index = trg_vocab.stoi[EOS_TOKEN]
     else:
         src_eos_index = None
@@ -813,11 +839,12 @@ def print_examples(example_iter, model, n=2, max_len=100,
       
         result, _ = beam_decode(
           model, batch.src, batch.src_mask, batch.src_lengths,
-          max_len=max_len, sos_index=trg_sos_index, eos_index=trg_eos_index)
+          batch.trg, batch.trg_mask,
+          max_len=max_len, sos_index=src_sos_index, eos_index=src_eos_index)
         print("Example #%d" % (i+1))
         print("NL : ", " ".join(lookup_words(src, vocab=src_vocab)))
         print("AMR : ", " ".join(lookup_words(trg, vocab=trg_vocab)))
-        print("Pred: ", " ".join(lookup_words(result, vocab=trg_vocab)))
+        print("Pred: ", " ".join(lookup_words(result, vocab=src_vocab)))
         print()
         
         count += 1
@@ -903,9 +930,9 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
         #writer.add_scalar("train loss", train_loss, epoch)
         model.eval()
         with torch.no_grad():
-            print("val examples")
-            print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
-                           model, n=3, src_vocab=NL_SRC.vocab, trg_vocab=AMR_SRC.vocab)        
+            #print("val examples")
+            #print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
+            #               model, n=3, src_vocab=NL_SRC.vocab, trg_vocab=AMR_SRC.vocab)        
 
             #print("train examples")
             #print_examples((rebatch(PAD_INDEX, x) for x in train_iter), 
@@ -937,12 +964,13 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
       batch = rebatch(PAD_INDEX, batch)
       pred, attention = beam_decode(
         model, batch.src, batch.src_mask, batch.src_lengths,
+        batch.trg, batch.trg_mask,
         sos_index=targ_field.vocab.stoi[SOS_TOKEN],
         eos_index=targ_field.vocab.stoi[EOS_TOKEN])
       hypotheses.append(pred)
       alphas.append(attention)
 
-    hypotheses = [lookup_words(x, AMR_SRC.vocab) for x in hypotheses]
+    hypotheses = [lookup_words(x, NL_SRC.vocab) for x in hypotheses]
     hypotheses = [" ".join(x) for x in hypotheses]
 
     with open(file_name, "w") as file:
@@ -954,7 +982,7 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
 
 for error in range(1,2):
     my_data = {}
-    num_batches=100
+    num_batches=10
     error_per = error/10. 
 
     for split in ["train", "val", "test"]:
