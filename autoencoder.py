@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/storage/czw/anaconda3/envs/anno/bin/python3
 # coding: utf-8
 import random
 import numpy as np
@@ -15,9 +15,9 @@ from torchtext import data, datasets
 
 import spacy
 
-#USE_CUDA = torch.cuda.is_available()
-USE_CUDA = False 
-DEVICE=torch.device('cpu') # or set to 'cpu'
+USE_CUDA = torch.cuda.is_available()
+#USE_CUDA = False 
+DEVICE=torch.device('cuda') # or set to 'cpu'
 print("CUDA:", USE_CUDA)
 print(DEVICE)
 
@@ -33,17 +33,17 @@ class Autoencoder(nn.Module):
         self.enc_dec_1 = EncoderDecoder1
         self.enc_dec_2 = EncoderDecoder2
 
-    def forward(self, src, trg, src_mask, trg_mask, src_lengths, trg_lengths):
+    def forward(self, nl_src, amr_src, nl_src_mask, amr_src_mask, nl_src_lengths, amr_src_lengths):
         """Take in and process masked src and target sequences.
-            src is [batch, seq_len] (ends with end token?)
-            trg is [batch, seq_len] (begins with start token?)
-            src_mask is [batch, 1, seq_len]
-            trg_mask is [batch, seq_len]
-            src_lengths is [batch]
-            trg_lengths is [batch]
+            nl_src is [batch, seq_len] (ends with end token?)
+            amr_src is [batch, seq_len] (begins with start token?)
+            nl_src_mask is [batch, 1, seq_len]
+            amr_src_mask is [batch, seq_len]
+            nl_src_lengths is [batch]
+            amr_src_lengths is [batch]
         """
-        encoder_hidden, encoder_final = self.enc_dec_1.encode(src, src_mask, src_lengths)
-        out, hidden, pre_output = self.enc_dec_1.decode(encoder_hidden, encoder_final, src_mask, trg, trg_mask)
+        encoder_hidden, encoder_final = self.enc_dec_1.encode(nl_src, nl_src_mask, nl_src_lengths)
+        out, hidden, pre_output = self.enc_dec_1.decode(encoder_hidden, encoder_final, nl_src_mask, amr_src, amr_src_mask)
         #out is [batch, seq_len, hidden_size]
         #pre_output is concat of rnn out, context, and prev_embed
         #which has been fed through a linear layer
@@ -53,13 +53,13 @@ class Autoencoder(nn.Module):
         #out is [batch, seq_len]
         #print(pred.size())
         #TODO get rid of magic number
-        amr_src, amr_src_mask, amr_src_lengths = get_intermediary_batch(pred, 3)
-        print("czw auto amr_src", amr_src.size())
-        print("czw auto amr_src_mask", amr_src_mask.size())
-        print("czw auto amr_src_lengths", amr_src_lengths.size())
-        encoder_hidden, encoder_final = self.enc_dec_2.encode(amr_src, amr_src_mask, amr_src_lengths)
-        print("czw auto src (as target)" , src.size())
-        out, hidden, pre_output = self.enc_dec_2.decode(encoder_hidden, encoder_final, amr_src_mask, src, src_mask)
+        inter_src, inter_mask, inter_lengths = get_intermediary_batch(pred, 3)
+        print("czw auto inter_src", inter_src.size())
+        print("czw auto inter_src_mask", inter_mask.size())
+        print("czw auto inter_src_lengths", inter_lengths.size())
+        encoder_hidden, encoder_final = self.enc_dec_2.encode(inter_src, inter_mask, inter_lengths)
+        print("czw auto src (as target)" , nl_src.size())
+        out, hidden, pre_output = self.enc_dec_2.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask)
         return out, hidden, pre_output
 
 def get_intermediary_batch(src, amr_eos_token):
@@ -78,13 +78,17 @@ def get_intermediary_batch(src, amr_eos_token):
         row = np_src[i]
         eos_indices = np.where(row==amr_eos_token)[0]
         length = max_len
+    #    print(row)
+    #    print(eos_indices)
         if len(eos_indices) > 0:
             length = eos_indices[0] + 1
         lengths.append(length)
         mask.append([[0]*length + [1]*(max_len - length)])
         #print (row)
-    print(lengths)
-    return src, torch.Tensor(mask), torch.Tensor(lengths)
+    #print(lengths)
+    tensor_mask = torch.Tensor(mask).cuda() if USE_CUDA else torch.Tensor(mask)
+    tensor_lengths = torch.Tensor(lengths).cuda() if USE_CUDA else torch.Tensor(lengths)
+    return src, tensor_mask, tensor_lengths 
 
 class EncoderDecoder(nn.Module):
     """
@@ -486,7 +490,9 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0, pha
         #print("czw amr_lengths", amr_lengths.size())
         #print("czw amr_mask", amr_mask.size())
  
+        print("begin loss compute")
         loss = loss_compute(pre_output, batch.src, batch.nseqs)
+        print("end loss compute")
         #print(f'epoch loss {loss}')
         total_loss += loss
         total_tokens += batch.ntokens
@@ -620,7 +626,7 @@ class NoisyLossCompute:
                 random_targ.fill(self.pad_index)
                 #random_targ.fill(18)
                 random_targ[:rand_size] = np.random.randint(self.pad_index+1, self.trg_vocab_size, size=rand_size)
-                #rand_words = lookup_words(random_targ, TRG.vocab)
+                #rand_words = lookup_words(random_targ, AMR_SRC.vocab)
                 #rand_words = " ".join(rand_words)
                 #print(rand_words)
  
@@ -809,8 +815,8 @@ def print_examples(example_iter, model, n=2, max_len=100,
           model, batch.src, batch.src_mask, batch.src_lengths,
           max_len=max_len, sos_index=trg_sos_index, eos_index=trg_eos_index)
         print("Example #%d" % (i+1))
-        print("Src : ", " ".join(lookup_words(src, vocab=src_vocab)))
-        print("Trg : ", " ".join(lookup_words(trg, vocab=trg_vocab)))
+        print("NL : ", " ".join(lookup_words(src, vocab=src_vocab)))
+        print("AMR : ", " ".join(lookup_words(trg, vocab=trg_vocab)))
         print("Pred: ", " ".join(lookup_words(result, vocab=trg_vocab)))
         print()
         
@@ -825,9 +831,9 @@ EOS_TOKEN = "</s>"
 LOWER = True
 
 # we include lengths to provide to the RNNs
-SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
+NL_SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
                  unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
-TRG = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
+AMR_SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
                  unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
 
 def print_data_info(my_data, src_field, trg_field):
@@ -872,7 +878,7 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
 
     criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
     #criterion = OracleCriterion(PAD_INDEX)
-    criterion = PermissiveCriterion(PAD_INDEX)
+    #criterion = PermissiveCriterion(PAD_INDEX)
     #criterion = myNLL(PAD_INDEX)
     optim = torch.optim.Adam(model.parameters(), lr=lr)
     
@@ -886,8 +892,8 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
         train_perplexity, train_loss = run_epoch((rebatch(PAD_INDEX, b) for b in train_iter), 
                                      model,
                                      SimpleLossCompute(model.enc_dec_2.generator, criterion, optim),
-                                     #TokenNoiseLossCompute(model.generator, criterion, error_per, len(TRG.vocab), PAD_INDEX, optim),
-                                     #NoisyLossCompute(model.generator, criterion, error_per, len(TRG.vocab), PAD_INDEX, optim),
+                                     #TokenNoiseLossCompute(model.generator, criterion, error_per, len(AMR_SRC.vocab), PAD_INDEX, optim),
+                                     #NoisyLossCompute(model.generator, criterion, error_per, len(AMR_SRC.vocab), PAD_INDEX, optim),
                                      #PermissiveLossCompute(model.generator, criterion, optim),
                                      print_every=print_every,
                                      num_batches=num_batches,
@@ -899,11 +905,11 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
         with torch.no_grad():
             print("val examples")
             print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
-                           model, n=3, src_vocab=SRC.vocab, trg_vocab=TRG.vocab)        
+                           model, n=3, src_vocab=NL_SRC.vocab, trg_vocab=AMR_SRC.vocab)        
 
             #print("train examples")
             #print_examples((rebatch(PAD_INDEX, x) for x in train_iter), 
-            #               model, n=3, src_vocab=SRC.vocab, trg_vocab=TRG.vocab)        
+            #               model, n=3, src_vocab=NL_SRC.vocab, trg_vocab=AMR_SRC.vocab)        
 
             dev_perplexity, val_loss = run_epoch((rebatch(PAD_INDEX, b) for b in valid_iter), 
                                        model, 
@@ -936,7 +942,7 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
       hypotheses.append(pred)
       alphas.append(attention)
 
-    hypotheses = [lookup_words(x, TRG.vocab) for x in hypotheses]
+    hypotheses = [lookup_words(x, AMR_SRC.vocab) for x in hypotheses]
     hypotheses = [" ".join(x) for x in hypotheses]
 
     with open(file_name, "w") as file:
@@ -953,14 +959,14 @@ for error in range(1,2):
 
     for split in ["train", "val", "test"]:
         my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
-                        exts=('.nl', '.amr'), fields=(SRC, TRG))
+                        exts=('.nl', '.amr'), fields=(NL_SRC, AMR_SRC))
     MIN_FREQ = 5
-    SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
-    TRG.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
+    NL_SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
+    AMR_SRC.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
 
-    PAD_INDEX = TRG.vocab.stoi[PAD_TOKEN]
+    PAD_INDEX = AMR_SRC.vocab.stoi[PAD_TOKEN]
 
-    print_data_info(my_data, SRC, TRG)
+    print_data_info(my_data, NL_SRC, AMR_SRC)
     train_iter = data.BucketIterator(my_data["train"], batch_size=100, train=True, 
                                      sort_within_batch=True, 
                                      sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
@@ -968,14 +974,14 @@ for error in range(1,2):
 
     valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
 
-    model = make_autoencoder(len(SRC.vocab), len(TRG.vocab),
+    model = make_autoencoder(len(NL_SRC.vocab), len(AMR_SRC.vocab),
                        emb_size=500, hidden_size=500,
                        num_layers=2, dropout=0.5)
     dev_perplexities = train(model, num_epochs=15, print_every=500, num_batches=num_batches, error_per=error_per)
     #torch.save(model, "reverse.pt")
     #file_name = "reverse.pred"
     print(file_name)
-    eval_val(file_name, model, valid_iter, TRG, my_data)
+    eval_val(file_name, model, valid_iter, AMR_SRC, my_data)
 
 #writer.close()
 # ## Attention Visualization
