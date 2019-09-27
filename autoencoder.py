@@ -16,17 +16,20 @@ from torchtext import data, datasets
 import spacy
 
 USE_CUDA = torch.cuda.is_available()
-#USE_CUDA = False 
 DEVICE=torch.device('cuda') # or set to 'cpu'
 print("CUDA:", USE_CUDA)
 print(DEVICE)
+NUM_EPOCHS = 60
+BATCH_SIZE = 64
+NUM_BATCHES = 100
+exp_name = f'{NUM_EPOCHS}_ep_{NUM_BATCHES}_batches'
 
 seed = 42
 np.random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
-#writer = SummaryWriter()
+writer = SummaryWriter(f'runs/{exp_name}')
 class Autoencoder(nn.Module):
     def __init__(self, EncoderDecoder1, EncoderDecoder2, amr_eos_token):
         super(Autoencoder, self).__init__()
@@ -41,8 +44,10 @@ class Autoencoder(nn.Module):
             amr_src is [batch, seq_len] (begins with start token?)
             amr_src_mask is [batch, seq_len]
         """
+        #print("czw autoencoder feed into first encoder")
         encoder_hidden, encoder_final = self.enc_dec_1.encode(nl_src, nl_src_mask, nl_src_lengths)
-        print("czw encode encoder_hidden", encoder_hidden)
+        #print("czw encode encoder_hidden", encoder_hidden)
+        #print("czw autoencoder feed into first decoder")
         out, hidden, pre_output = self.enc_dec_1.decode(encoder_hidden, encoder_final, nl_src_mask, amr_src, amr_src_mask)
         #out is [batch, seq_len, hidden_size]
         #pre_output is concat of rnn out, context, and prev_embed
@@ -54,16 +59,27 @@ class Autoencoder(nn.Module):
         #print(pred.size())
         #TODO get rid of magic number
         inter_src, inter_mask, inter_lengths = get_intermediary_batch(pred, 3)
-        print("czw auto inter_src", inter_src.size())
-        print("czw auto inter_src_mask", inter_mask.size())
-        print("czw auto inter_src_lengths", inter_lengths.size())
+        #print("czw auto inter_src_mask", inter_mask.size())
+        #print("czw auto inter_src_lengths", inter_lengths.size())
+        #print("czw feed into second encoder")
+        #print(lookup_words(inter_src[0], AMR_SRC.vocab))
+        #print("czw auto inter_src", inter_src)
         encoder_hidden, encoder_final = self.enc_dec_2.encode(inter_src, inter_mask, inter_lengths)
-        print("czw auto src (as target)" , nl_src.size())
+        #print("czw auto src (as target)" , nl_src.size())
         return encoder_hidden, encoder_final, inter_mask
     
     def decode(self, encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask,
                decoder_hidden=None):
+        assert not (encoder_final[0] != encoder_final[0]).any()
+        assert not (encoder_final[1] != encoder_final[1]).any()
+        assert not (inter_mask != inter_mask).any()
+        #print("czw feed into second decoder")
+        #print(lookup_words(nl_src[0], NL_SRC.vocab))
         out, hidden, pre_output = self.enc_dec_2.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask, decoder_hidden=decoder_hidden)
+
+        assert not (out != out).any()
+        assert not (hidden[0] != hidden[0]).any()
+        assert not (pre_output != pre_output).any()
         return out, hidden, pre_output
 
 
@@ -76,7 +92,17 @@ class Autoencoder(nn.Module):
             nl_src_lengths is [batch]
             amr_src_lengths is [batch]
         """
+        assert not (nl_src != nl_src).any()
+        assert not (amr_src != amr_src).any()
+        assert not (nl_src_mask != nl_src_mask).any()
+        assert not (amr_src_mask != amr_src_mask).any()
+        assert not (nl_src_lengths != nl_src_lengths).any()
+        assert not (amr_src_lengths != amr_src_lengths).any()
         encoder_hidden, encoder_final, inter_mask = self.encode(nl_src, nl_src_mask, nl_src_lengths, amr_src, amr_src_mask)
+        assert not (encoder_hidden != encoder_hidden).any()
+        assert not (encoder_final[0] != encoder_final[0]).any()
+        assert not (encoder_final[1] != encoder_final[1]).any()
+        assert not (inter_mask != inter_mask).any()
         return self.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask)
 
 def get_intermediary_batch(src, amr_eos_token):
@@ -91,6 +117,11 @@ def get_intermediary_batch(src, amr_eos_token):
     mask = []
     lengths = []
     max_len = np_src.shape[1]
+
+    #TODO remove hack
+    for i in range(src.size(0)):
+        src[i][max_len-1] = amr_eos_token
+
     for i in range(np_src.shape[0]):
         row = np_src[i]
         eos_indices = np.where(row==amr_eos_token)[0]
@@ -103,7 +134,9 @@ def get_intermediary_batch(src, amr_eos_token):
         mask.append([[0]*length + [1]*(max_len - length)])
         #print (row)
     #print(lengths)
-    tensor_mask = torch.Tensor(mask).cuda() if USE_CUDA else torch.Tensor(mask)
+    #print("made mask", mask)
+    tensor_mask = torch.Tensor(mask).ne(1)
+    tensor_mask = tensor_mask.cuda() if USE_CUDA else tensor_mask
     tensor_lengths = torch.Tensor(lengths).cuda() if USE_CUDA else torch.Tensor(lengths)
     return src, tensor_mask, tensor_lengths 
 
@@ -126,13 +159,25 @@ class EncoderDecoder(nn.Module):
         return self.decode(encoder_hidden, encoder_final, src_mask, trg, trg_mask)
     
     def encode(self, src, src_mask, src_lengths):
-        print("czw encoderdecoder encode src", src)
-        print("czw encoderdecoder encode src lengths", src_lengths)
-        return self.encoder(self.src_embed(src), src_mask, src_lengths)
+        #print("czw encoderdecoder encode src", src)
+        #print("czw encoderdecoder encode src.size", src.size())
+        #print("czw encoderdecoder encode src lengths", src_lengths)
+        embedded =  self.src_embed(src)
+        assert not (src != src).any()
+        #print("czw encoderdecoder encode src after embed",embedded)
+        assert not (embedded != embedded).any()
+        return self.encoder(embedded, src_mask, src_lengths)
     
     def decode(self, encoder_hidden, encoder_final, src_mask, trg, trg_mask,
                decoder_hidden=None):
-        return self.decoder(self.trg_embed(trg), encoder_hidden, encoder_final,
+        assert not (trg != trg).any()
+        embedded = self.trg_embed(trg)
+        assert not (embedded != embedded).any()
+        assert not (encoder_hidden != encoder_hidden).any()
+        if decoder_hidden is not None:
+            assert not (decoder_hidden[0] != decoder_hidden[0]).any()
+            assert not (decoder_hidden[1] != decoder_hidden[1]).any()
+        return self.decoder(embedded, encoder_hidden, encoder_final,
                             src_mask, trg_mask, hidden=decoder_hidden)
 
 
@@ -150,12 +195,6 @@ class Generator(nn.Module):
         """
         return F.log_softmax(self.proj(x), dim=-1)
 
-
-# ## Encoder
-# 
-# Our encoder is a bi-directional LSTM. 
-# 
-# Because we want to process multiple sentences at the same time for speed reasons (it is more effcient on GPU), we need to support **mini-batches**. Sentences in a mini-batch may have different lengths, which means that the RNN needs to unroll further for certain sentences while it might already have finished for others:
 class Encoder(nn.Module):
     """Encodes a sequence of word embeddings"""
     def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.):
@@ -171,7 +210,7 @@ class Encoder(nn.Module):
         x should have dimensions [batch, time, dim].
         mask is [batch, 1, seq_len]
         """
-        print("czw encoder x", x.size())
+        #print("czw encoder x", x)
         packed = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
         output, final = self.rnn(packed)
         output, _ = pad_packed_sequence(output, batch_first=True)
@@ -189,21 +228,6 @@ class Encoder(nn.Module):
         bwd_final_cell = final[1][1:final[1].size(0):2]
         final_cell = torch.cat([fwd_final_cell, bwd_final_cell], dim=2)  # [num_layers, batch, num_directions*dim]
         return output, (final_hidden, final_cell)
-
-
-# ### Decoder
-# 
-# The decoder is a conditional LSTM. Rather than starting with an empty state like the encoder, its initial hidden state results from a projection of the encoder final vector. 
-# 
-# #### Training
-# In `forward` you can find a for-loop that computes the decoder hidden states one time step at a time. 
-# Note that, during training, we know exactly what the target words should be! (They are in `trg_embed`.) This means that we are not even checking here what the prediction is! We simply feed the correct previous target word embedding to the LSTM at each time step. This is called teacher forcing.
-# 
-# The `forward` function returns all decoder hidden states and pre-output vectors. Elsewhere these are used to compute the loss, after which the parameters are updated.
-# 
-# #### Prediction
-# For prediction time, for forward function is only used for a single time step. After predicting a word from the returned pre-output vector, we can call it again, supplying it the word embedding of the previously predicted word and the last state.
-
 
 class Decoder(nn.Module):
     """A conditional RNN decoder with attention."""
@@ -239,14 +263,18 @@ class Decoder(nn.Module):
            encoder_hidden is atuple of elements with size (batch_size x seq_len x num_directions*hidden_size) is the output of the encoder
            hidden (batch_size x 1 x hidden_size) is the forward hidden state of the previous time step
         """
-
+        assert not (prev_embed != prev_embed).any()        
         # compute context vector using attention mechanism
         #we only want the hidden, not the cell state of the lstm CZW, hence the hidden[0]
         query = hidden[0][-1].unsqueeze(1)  # [#layers, B, D] -> [B, 1, D]
+        assert not (query != query).any()        
+        #print("czw Decoder src_mask", src_mask)
         context, attn_probs = self.attention(
             query=query, proj_key=proj_key,
             value=encoder_hidden, mask=src_mask)
 
+        assert not (context != context).any()        
+        assert not (attn_probs != attn_probs).any()        
         # update rnn hidden state
         # context is batch x 1 x num_directions*hidden_size
         # the lstm takes the previous target embedding and the attention context as input
@@ -280,12 +308,13 @@ class Decoder(nn.Module):
         # initialize decoder hidden state
         if hidden is None:
             hidden = self.init_hidden(encoder_final)
-        
+            assert not (hidden[0] != hidden[0]).any()        
+            assert not (hidden[1] != hidden[1]).any()        
         # pre-compute projected encoder hidden states
         # (the "keys" for the attention mechanism)
         # this is only done for efficiency
         proj_key = self.attention.key_layer(encoder_hidden)
-        
+        assert not (proj_key != proj_key).any()        
         # here we store all intermediate hidden states and pre-output vectors
         decoder_states = []
         pre_output_vectors = []
@@ -296,6 +325,10 @@ class Decoder(nn.Module):
             prev_embed = trg_embed[:, i].unsqueeze(1)
             output, hidden, pre_output = self.forward_step(
               prev_embed, encoder_hidden, src_mask, proj_key, hidden)
+            assert not (hidden[0] != hidden[0]).any()        
+            assert not (hidden[1] != hidden[1]).any()        
+            assert not (output != output).any()        
+            assert not (pre_output != pre_output).any()        
             decoder_states.append(output)
             pre_output_vectors.append(pre_output)
 
@@ -314,28 +347,6 @@ class Decoder(nn.Module):
 
         return (torch.tanh(self.bridge_hidden(encoder_final[0])),
                 torch.tanh(self.bridge_cell(encoder_final[1])))
-
-
-# ### Attention                                                                                                                                                                               
-# 
-# At every time step, the decoder has access to *all* source word representations $\mathbf{h}_1, \dots, \mathbf{h}_M$. 
-# An attention mechanism allows the model to focus on the currently most relevant part of the source sentence.
-# The state of the decoder is represented by GRU hidden state $\mathbf{s}_i$.
-# So if we want to know which source word representation(s) $\mathbf{h}_j$ are most relevant, we will need to define a function that takes those two things as input.
-# 
-# Here we use the MLP-based, additive attention that was used in Bahdanau et al.
-# 
-# 
-# We apply an MLP with tanh-activation to both the current decoder state $\bf s_i$ (the *query*) and each encoder state $\bf h_j$ (the *key*), and then project this to a single value (i.e. a scalar) to get the *attention energy* $e_{ij}$. 
-# 
-# Once all energies are computed, they are normalized by a softmax so that they sum to one: 
-# 
-# $$ \alpha_{ij} = \text{softmax}(\mathbf{e}_i)[j] $$
-# 
-# $$\sum_j \alpha_{ij} = 1.0$$ 
-# 
-# The context vector for time step $i$ is then a weighted sum of the encoder hidden states (the *values*):
-# $$\mathbf{c}_i = \sum_j \alpha_{ij} \mathbf{h}_j$$
 
 class BahdanauAttention(nn.Module):
     """Implements Bahdanau (MLP) attention"""
@@ -361,23 +372,30 @@ class BahdanauAttention(nn.Module):
         # The projected keys (the encoder states) were already pre-computated.
         query = self.query_layer(query)
         
+        assert not (query != query).any() 
         # Calculate scores.
         #print(query.size())
         #print(proj_key.size())
         scores = self.energy_layer(torch.tanh(query + proj_key))
+        assert not (scores != scores).any() 
         scores = scores.squeeze(2).unsqueeze(1)
         
         # Mask out invalid positions.
         # The mask marks valid positions so we invert it using `mask & 0`.
         scores.data.masked_fill_(mask == 0, -float('inf'))
         
+        assert not (scores != scores).any() 
         # Turn scores to probabilities.
         alphas = F.softmax(scores, dim=-1)
         self.alphas = alphas        
         
+        #print(mask)
+        #print(scores)
+        #print(scores.size())
+        assert not (alphas != alphas).any() 
         # The context vector is the weighted sum of the values.
         context = torch.bmm(alphas, value)
-        
+        assert not (context != context).any() 
         # context shape: [B, 1, 2D], alphas shape: [B, 1, M]
         return context, alphas
 
@@ -393,23 +411,21 @@ class BahdanauAttention(nn.Module):
 def make_autoencoder(nl_vocab, amr_vocab, emb_size=256, hidden_size=512, num_layers=1, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
 
-    attention = BahdanauAttention(hidden_size)
-
-    nl_embed = nn.Embedding(nl_vocab, emb_size)
-    amr_embed = nn.Embedding(amr_vocab, emb_size)
+    attention1 = BahdanauAttention(hidden_size)
+    attention2 = BahdanauAttention(hidden_size)
 
     EncoderDecoder1 = EncoderDecoder(
         Encoder(emb_size, hidden_size, num_layers=num_layers, dropout=dropout),
-        Decoder(emb_size, hidden_size, attention, num_layers=num_layers, dropout=dropout),
-        nl_embed, #src_embed 
-        amr_embed, #tgt_embed 
+        Decoder(emb_size, hidden_size, attention1, num_layers=num_layers, dropout=dropout),
+        nn.Embedding(nl_vocab, emb_size),
+        nn.Embedding(amr_vocab, emb_size),
         Generator(hidden_size, amr_vocab))
 
     EncoderDecoder2 = EncoderDecoder(
         Encoder(emb_size, hidden_size, num_layers=num_layers, dropout=dropout),
-        Decoder(emb_size, hidden_size, attention, num_layers=num_layers, dropout=dropout),
-        amr_embed, #src_embed
-        nl_embed, #tgt_embed
+        Decoder(emb_size, hidden_size, attention2, num_layers=num_layers, dropout=dropout),
+        nn.Embedding(amr_vocab, emb_size),
+        nn.Embedding(nl_vocab, emb_size),
         Generator(hidden_size, nl_vocab))
 
     #TODO magic number
@@ -491,13 +507,13 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0, pha
         out, _, pre_output = model.forward(batch.src, batch.trg,
                                            batch.src_mask, batch.trg_mask,
                                            batch.src_lengths, batch.trg_lengths)
-        print("czw batch src", type(batch.src), batch.src.size())
-        print("czw batch trg", type(batch.trg), batch.trg.size())
-        print("czw batch src mask", type(batch.src_mask), batch.src_mask.size())
-        print("czw batch trg mask", type(batch.trg_mask), batch.trg_mask.size())
-        print("czw batch src_lengths", type(batch.src_lengths), batch.src_lengths.size())
-        print("czw out", out.size())
-        print("czw pre_output", pre_output.size())
+        #print("czw batch src", type(batch.src), batch.src.size())
+        #print("czw batch trg", type(batch.trg), batch.trg.size())
+        #print("czw batch src mask", type(batch.src_mask), batch.src_mask.size())
+        #print("czw batch trg mask", type(batch.trg_mask), batch.trg_mask.size())
+        #print("czw batch src_lengths", type(batch.src_lengths), batch.src_lengths.size())
+        #print("czw out", out.size())
+        #print("czw pre_output", pre_output.size())
 
         #pred = model.generator(pre_output)
         #out is [batch, seq_len, vocab_size]
@@ -509,9 +525,10 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0, pha
         #print("czw amr_lengths", amr_lengths.size())
         #print("czw amr_mask", amr_mask.size())
  
-        print("begin loss compute")
+        #print("begin loss compute")
+        assert not (pre_output != pre_output).any()
         loss = loss_compute(pre_output, batch.src, batch.nseqs)
-        print("end loss compute")
+        #print("end loss compute")
         #print(f'epoch loss {loss}')
         total_loss += loss
         total_tokens += batch.ntokens
@@ -539,9 +556,10 @@ class myNLL:
         #y is a list of indicies into a vocab_size vector (batch*seq_length)
         mask = y.ne(self.pad_index) # this is a mask that is the shape of a 1D list 
         probs = x[torch.arange(x.size(0)), y] #index select
+        #print("czw myNLL probs", probs)
         masked_probs = torch.masked_select(probs, mask)
         loss = -torch.sum(masked_probs)#sum for log prob
-        #print("czw loss", loss)
+        #print("czw loss myNLL", loss)
         return loss
 
 class PermissiveCriterion:
@@ -612,12 +630,14 @@ class TokenNoiseLossCompute:
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               new_y.contiguous().view(-1))
         loss = loss / norm
+        assert not (loss != loss).any()
 
         if self.opt is not None:
             loss.backward()          
             self.opt.step()
             self.opt.zero_grad()
 
+        #print("czw loss", loss.data.item() * norm)
         return loss.data.item() * norm
  
 class NoisyLossCompute:
@@ -704,12 +724,14 @@ class SimpleLossCompute:
 
     def __call__(self, x, y, norm):
         x = self.generator(x)
-        print("czw x", x.size())
-        print("czw y", y.size())
+        #print("czw x", x.size())
+        #print("czw y", y.size())
+        #print("czw y", y)
         #print("czw x", x.contiguous().view(-1, x.size(-1)).size())
         #print("czw y", y.contiguous().view(-1).size())
         #x.view(-1,x.size(-1)) creates a block that is (n_seq*seq_leq, vocab_size)
         #y.view creates a 1D list of indices
+        #print(lookup_words(y.contiguous().view(-1), NL_SRC.vocab))
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               y.contiguous().view(-1))
         #use the below for NLLLoss()
@@ -718,12 +740,14 @@ class SimpleLossCompute:
         #print("czw x", x.view(-1, x.size(-1)))
         #print("czw y", y.contiguous().view(-1))
         loss = loss / norm
-
+        assert not (x != x).any()
+        assert not (loss != loss).any()
         if self.opt is not None:
             loss.backward()          
             self.opt.step()
             self.opt.zero_grad()
 
+        #print("czw loss", loss)
         return loss.data.item() * norm
 
 class BeamNode():
@@ -734,34 +758,36 @@ class BeamNode():
         self.logProb = logProb
         self.attention_scores = attention_scores
 
-def beam_decode(model, src, src_mask, src_lengths, trg, trg_mask, max_len=100, sos_index=1, eos_index=None, beam_size=5):
+def beam_decode(model, nl, nl_mask, nl_lengths, amr, amr_mask, max_len=100, nl_sos_index=1, nl_eos_index=None, beam_size=5):
 
     #src is nl
     #trg is amr
 
     with torch.no_grad():
-        encoder_hidden, encoder_final, inter_mask = model.encode(src, src_mask, src_lengths, trg, trg_mask)
+        encoder_hidden, encoder_final, inter_mask = model.encode(nl, nl_mask, nl_lengths, amr, amr_mask)
 
     output = []
     hidden = None
 
     i = 0
     beam_nodes = []
-    beam_nodes.append(BeamNode(sos_index, hidden, 0))
+    beam_nodes.append(BeamNode(nl_sos_index, hidden, 0))
     ended = False #Flag raised when EOS token found
     while i<max_len and not ended:
         new_nodes = []
         for node in beam_nodes:
             prev_word = node.prev_input
             #print('czw prev word', prev_word)
-            prev_y = torch.ones(1, 1).fill_(prev_word).type_as(src)
-            trg_mask = torch.ones_like(prev_y)
+            prev_y = torch.ones(1, 1).fill_(prev_word).type_as(nl)
+            nl_mask = torch.ones_like(prev_y)
             hidden = node.prev_h
+            #if hidden is not None:
+            #    print("czw beam_decode hidden", hidden[0])
             with torch.no_grad():
                 out, hidden, pre_output = model.decode(
                   encoder_hidden, encoder_final, inter_mask,
-                  prev_y, trg_mask, hidden)
-
+                  prev_y, nl_mask, hidden)
+                #print("czw beam_decode hidden", hidden[0])
                 # we predict from the pre-output layer, which is
                 # a combination of Decoder state, prev emb, and context
                 prob = model.enc_dec_2.generator(pre_output[:, -1])
@@ -769,8 +795,9 @@ def beam_decode(model, src, src_mask, src_lengths, trg, trg_mask, max_len=100, s
             probs, words = torch.topk(prob, beam_size, dim=1)
             probs = probs.squeeze().cpu().numpy()
             words = words.squeeze().cpu().numpy()
-            print("czw words", words)
-            print("czw probs", probs)
+            #print("czw words", words)
+            #print("czw words", lookup_words(words, NL_SRC.vocab))
+            #print("czw probs", probs)
 
             for j in range(len(probs)):
                 probj = probs[j]
@@ -782,12 +809,16 @@ def beam_decode(model, src, src_mask, src_lengths, trg, trg_mask, max_len=100, s
                 new_nodes.append(new_node)
         i+=1
         beam_nodes = sorted(new_nodes, key=lambda node: -node.logProb)[:beam_size] 
-        ended = any([True if node.prev_input==eos_index else False for node in beam_nodes])
+        #print("czw beam nodes", lookup_words([n.prev_input for n in beam_nodes], NL_SRC.vocab))
+        #print("czw beam probs", [n.logProb for n in beam_nodes])
+        ended = any([True if node.prev_input==nl_eos_index else False for node in beam_nodes])
 
+    #print("out of loop")
     output = []
     attns = []
+    #print("czw beam nodes finish", lookup_words([n.prev_input for n in beam_nodes], NL_SRC.vocab))
     if ended:
-        end_node_i = [1 if node.prev_input==eos_index else 0 for node in beam_nodes].index(1)
+        end_node_i = [1 if node.prev_input==nl_eos_index else 0 for node in beam_nodes].index(1)
         end_node = beam_nodes[end_node_i]
         output = np.array(end_node.words[:-1])
     else:
@@ -840,7 +871,7 @@ def print_examples(example_iter, model, n=2, max_len=100,
         result, _ = beam_decode(
           model, batch.src, batch.src_mask, batch.src_lengths,
           batch.trg, batch.trg_mask,
-          max_len=max_len, sos_index=src_sos_index, eos_index=src_eos_index)
+          max_len=max_len, nl_sos_index=trg_sos_index, nl_eos_index=src_eos_index)
         print("Example #%d" % (i+1))
         print("NL : ", " ".join(lookup_words(src, vocab=src_vocab)))
         print("AMR : ", " ".join(lookup_words(trg, vocab=trg_vocab)))
@@ -927,12 +958,12 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
                                      phase="train")
         
         print("train loss", train_loss)
-        #writer.add_scalar("train loss", train_loss, epoch)
+        writer.add_scalar("train loss", train_loss, epoch)
         model.eval()
         with torch.no_grad():
             #print("val examples")
-            #print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
-            #               model, n=3, src_vocab=NL_SRC.vocab, trg_vocab=AMR_SRC.vocab)        
+            print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
+                           model, n=3, src_vocab=NL_SRC.vocab, trg_vocab=AMR_SRC.vocab)        
 
             #print("train examples")
             #print_examples((rebatch(PAD_INDEX, x) for x in train_iter), 
@@ -940,9 +971,9 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
 
             dev_perplexity, val_loss = run_epoch((rebatch(PAD_INDEX, b) for b in valid_iter), 
                                        model, 
-                                       SimpleLossCompute(model.generator, criterion, None), 
+                                       SimpleLossCompute(model.enc_dec_2.generator, criterion, None), 
                                        phase="val")
-            #writer.add_scalar("val loss", val_loss, epoch)
+            writer.add_scalar("val loss", val_loss, epoch)
             print("Validation perplexity: %f" % dev_perplexity)
             print("val loss", val_loss)
             dev_perplexities.append(dev_perplexity)
@@ -965,8 +996,8 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
       pred, attention = beam_decode(
         model, batch.src, batch.src_mask, batch.src_lengths,
         batch.trg, batch.trg_mask,
-        sos_index=targ_field.vocab.stoi[SOS_TOKEN],
-        eos_index=targ_field.vocab.stoi[EOS_TOKEN])
+        nl_sos_index=src_field.vocab.stoi[SOS_TOKEN],
+        nl_eos_index=src_field.vocab.stoi[EOS_TOKEN])
       hypotheses.append(pred)
       alphas.append(attention)
 
@@ -980,38 +1011,34 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
     bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
     print(bleu)
 
-for error in range(1,2):
-    my_data = {}
-    num_batches=10
-    error_per = error/10. 
+my_data = {}
+error_per = 1/10. 
 
-    for split in ["train", "val", "test"]:
-        my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
-                        exts=('.nl', '.amr'), fields=(NL_SRC, AMR_SRC))
-    MIN_FREQ = 5
-    NL_SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
-    AMR_SRC.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
+for split in ["train", "val", "test"]:
+    my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
+                    exts=('.nl', '.amr'), fields=(NL_SRC, AMR_SRC))
+MIN_FREQ = 5
+NL_SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
+AMR_SRC.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
 
-    PAD_INDEX = AMR_SRC.vocab.stoi[PAD_TOKEN]
+PAD_INDEX = AMR_SRC.vocab.stoi[PAD_TOKEN]
 
-    print_data_info(my_data, NL_SRC, AMR_SRC)
-    train_iter = data.BucketIterator(my_data["train"], batch_size=100, train=True, 
-                                     sort_within_batch=True, 
-                                     sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
-                                     device=DEVICE)
+print_data_info(my_data, NL_SRC, AMR_SRC)
+train_iter = data.BucketIterator(my_data["train"], batch_size=BATCH_SIZE, train=True, 
+                                 sort_within_batch=True, 
+                                 sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
+                                 device=DEVICE)
 
-    valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
+valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
 
-    model = make_autoencoder(len(NL_SRC.vocab), len(AMR_SRC.vocab),
-                       emb_size=500, hidden_size=500,
-                       num_layers=2, dropout=0.5)
-    dev_perplexities = train(model, num_epochs=15, print_every=500, num_batches=num_batches, error_per=error_per)
-    #torch.save(model, "reverse.pt")
-    #file_name = "reverse.pred"
-    print(file_name)
-    eval_val(file_name, model, valid_iter, AMR_SRC, my_data)
+model = make_autoencoder(len(NL_SRC.vocab), len(AMR_SRC.vocab),
+                   emb_size=500, hidden_size=500,
+                   num_layers=2, dropout=0.5)
+dev_perplexities = train(model, num_epochs=NUM_EPOCHS, print_every=500, num_batches=NUM_BATCHES, error_per=error_per)
+torch.save(model, f'{exp_name}.pt')
+eval_val(f'{exp_name}.pred', model, valid_iter, AMR_SRC, my_data)
 
-#writer.close()
+writer.close()
 # ## Attention Visualization
 # 
 # We can also visualize the attention scores of the decoder.
