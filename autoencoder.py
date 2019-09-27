@@ -1,6 +1,7 @@
 #!/storage/czw/anaconda3/envs/anno/bin/python3
 # coding: utf-8
 import random
+import sacrebleu
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,6 +24,12 @@ NUM_EPOCHS = 60
 BATCH_SIZE = 64
 NUM_BATCHES = 100
 exp_name = f'{NUM_EPOCHS}_ep_{NUM_BATCHES}_batches'
+
+UNK_TOKEN = "<unk>"
+PAD_TOKEN = "<pad>"    
+SOS_TOKEN = "<s>"
+EOS_TOKEN = "</s>"
+
 
 seed = 42
 np.random.seed(seed)
@@ -70,16 +77,12 @@ class Autoencoder(nn.Module):
     
     def decode(self, encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask,
                decoder_hidden=None):
-        assert not (encoder_final[0] != encoder_final[0]).any()
-        assert not (encoder_final[1] != encoder_final[1]).any()
-        assert not (inter_mask != inter_mask).any()
+        
         #print("czw feed into second decoder")
         #print(lookup_words(nl_src[0], NL_SRC.vocab))
         out, hidden, pre_output = self.enc_dec_2.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask, decoder_hidden=decoder_hidden)
 
-        assert not (out != out).any()
-        assert not (hidden[0] != hidden[0]).any()
-        assert not (pre_output != pre_output).any()
+       
         return out, hidden, pre_output
 
 
@@ -92,17 +95,7 @@ class Autoencoder(nn.Module):
             nl_src_lengths is [batch]
             amr_src_lengths is [batch]
         """
-        assert not (nl_src != nl_src).any()
-        assert not (amr_src != amr_src).any()
-        assert not (nl_src_mask != nl_src_mask).any()
-        assert not (amr_src_mask != amr_src_mask).any()
-        assert not (nl_src_lengths != nl_src_lengths).any()
-        assert not (amr_src_lengths != amr_src_lengths).any()
         encoder_hidden, encoder_final, inter_mask = self.encode(nl_src, nl_src_mask, nl_src_lengths, amr_src, amr_src_mask)
-        assert not (encoder_hidden != encoder_hidden).any()
-        assert not (encoder_final[0] != encoder_final[0]).any()
-        assert not (encoder_final[1] != encoder_final[1]).any()
-        assert not (inter_mask != inter_mask).any()
         return self.decode(encoder_hidden, encoder_final, inter_mask, nl_src, nl_src_mask)
 
 def get_intermediary_batch(src, amr_eos_token):
@@ -163,20 +156,12 @@ class EncoderDecoder(nn.Module):
         #print("czw encoderdecoder encode src.size", src.size())
         #print("czw encoderdecoder encode src lengths", src_lengths)
         embedded =  self.src_embed(src)
-        assert not (src != src).any()
         #print("czw encoderdecoder encode src after embed",embedded)
-        assert not (embedded != embedded).any()
         return self.encoder(embedded, src_mask, src_lengths)
     
     def decode(self, encoder_hidden, encoder_final, src_mask, trg, trg_mask,
                decoder_hidden=None):
-        assert not (trg != trg).any()
         embedded = self.trg_embed(trg)
-        assert not (embedded != embedded).any()
-        assert not (encoder_hidden != encoder_hidden).any()
-        if decoder_hidden is not None:
-            assert not (decoder_hidden[0] != decoder_hidden[0]).any()
-            assert not (decoder_hidden[1] != decoder_hidden[1]).any()
         return self.decoder(embedded, encoder_hidden, encoder_final,
                             src_mask, trg_mask, hidden=decoder_hidden)
 
@@ -263,18 +248,14 @@ class Decoder(nn.Module):
            encoder_hidden is atuple of elements with size (batch_size x seq_len x num_directions*hidden_size) is the output of the encoder
            hidden (batch_size x 1 x hidden_size) is the forward hidden state of the previous time step
         """
-        assert not (prev_embed != prev_embed).any()        
         # compute context vector using attention mechanism
         #we only want the hidden, not the cell state of the lstm CZW, hence the hidden[0]
         query = hidden[0][-1].unsqueeze(1)  # [#layers, B, D] -> [B, 1, D]
-        assert not (query != query).any()        
         #print("czw Decoder src_mask", src_mask)
         context, attn_probs = self.attention(
             query=query, proj_key=proj_key,
             value=encoder_hidden, mask=src_mask)
 
-        assert not (context != context).any()        
-        assert not (attn_probs != attn_probs).any()        
         # update rnn hidden state
         # context is batch x 1 x num_directions*hidden_size
         # the lstm takes the previous target embedding and the attention context as input
@@ -308,13 +289,10 @@ class Decoder(nn.Module):
         # initialize decoder hidden state
         if hidden is None:
             hidden = self.init_hidden(encoder_final)
-            assert not (hidden[0] != hidden[0]).any()        
-            assert not (hidden[1] != hidden[1]).any()        
         # pre-compute projected encoder hidden states
         # (the "keys" for the attention mechanism)
         # this is only done for efficiency
         proj_key = self.attention.key_layer(encoder_hidden)
-        assert not (proj_key != proj_key).any()        
         # here we store all intermediate hidden states and pre-output vectors
         decoder_states = []
         pre_output_vectors = []
@@ -325,10 +303,6 @@ class Decoder(nn.Module):
             prev_embed = trg_embed[:, i].unsqueeze(1)
             output, hidden, pre_output = self.forward_step(
               prev_embed, encoder_hidden, src_mask, proj_key, hidden)
-            assert not (hidden[0] != hidden[0]).any()        
-            assert not (hidden[1] != hidden[1]).any()        
-            assert not (output != output).any()        
-            assert not (pre_output != pre_output).any()        
             decoder_states.append(output)
             pre_output_vectors.append(pre_output)
 
@@ -366,25 +340,21 @@ class BahdanauAttention(nn.Module):
         self.alphas = None
         
     def forward(self, query=None, proj_key=None, value=None, mask=None):
-        assert mask is not None, "mask is required"
 
         # We first project the query (the decoder state).
         # The projected keys (the encoder states) were already pre-computated.
         query = self.query_layer(query)
         
-        assert not (query != query).any() 
         # Calculate scores.
         #print(query.size())
         #print(proj_key.size())
         scores = self.energy_layer(torch.tanh(query + proj_key))
-        assert not (scores != scores).any() 
         scores = scores.squeeze(2).unsqueeze(1)
         
         # Mask out invalid positions.
         # The mask marks valid positions so we invert it using `mask & 0`.
         scores.data.masked_fill_(mask == 0, -float('inf'))
         
-        assert not (scores != scores).any() 
         # Turn scores to probabilities.
         alphas = F.softmax(scores, dim=-1)
         self.alphas = alphas        
@@ -392,10 +362,8 @@ class BahdanauAttention(nn.Module):
         #print(mask)
         #print(scores)
         #print(scores.size())
-        assert not (alphas != alphas).any() 
         # The context vector is the weighted sum of the values.
         context = torch.bmm(alphas, value)
-        assert not (context != context).any() 
         # context shape: [B, 1, 2D], alphas shape: [B, 1, M]
         return context, alphas
 
@@ -526,7 +494,6 @@ def run_epoch(data_iter, model, loss_compute, print_every=50, num_batches=0, pha
         #print("czw amr_mask", amr_mask.size())
  
         #print("begin loss compute")
-        assert not (pre_output != pre_output).any()
         loss = loss_compute(pre_output, batch.src, batch.nseqs)
         #print("end loss compute")
         #print(f'epoch loss {loss}')
@@ -630,7 +597,6 @@ class TokenNoiseLossCompute:
         loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
                               new_y.contiguous().view(-1))
         loss = loss / norm
-        assert not (loss != loss).any()
 
         if self.opt is not None:
             loss.backward()          
@@ -740,8 +706,6 @@ class SimpleLossCompute:
         #print("czw x", x.view(-1, x.size(-1)))
         #print("czw y", y.contiguous().view(-1))
         loss = loss / norm
-        assert not (x != x).any()
-        assert not (loss != loss).any()
         if self.opt is not None:
             loss.backward()          
             self.opt.step()
@@ -882,18 +846,6 @@ def print_examples(example_iter, model, n=2, max_len=100,
         if count == n:
             break
 
-UNK_TOKEN = "<unk>"
-PAD_TOKEN = "<pad>"    
-SOS_TOKEN = "<s>"
-EOS_TOKEN = "</s>"
-LOWER = True
-
-# we include lengths to provide to the RNNs
-NL_SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
-                 unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
-AMR_SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
-                 unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
-
 def print_data_info(my_data, src_field, trg_field):
     """ This prints some useful stuff about our data sets. """
     train_data = my_data["train"]
@@ -984,7 +936,6 @@ def train(model, num_epochs=10, lr=0.0003, print_every=100, num_batches=0, error
     model = torch.load("best_model.pt")
     return dev_perplexities
         
-import sacrebleu
 
 def eval_val(file_name, model, valid_iter, targ_field, datasets):
     references = [" ".join(example.trg) for example in datasets["val"]]
@@ -1010,35 +961,6 @@ def eval_val(file_name, model, valid_iter, targ_field, datasets):
 
     bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
     print(bleu)
-
-my_data = {}
-error_per = 1/10. 
-
-for split in ["train", "val", "test"]:
-    my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
-                    exts=('.nl', '.amr'), fields=(NL_SRC, AMR_SRC))
-MIN_FREQ = 5
-NL_SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
-AMR_SRC.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
-
-PAD_INDEX = AMR_SRC.vocab.stoi[PAD_TOKEN]
-
-print_data_info(my_data, NL_SRC, AMR_SRC)
-train_iter = data.BucketIterator(my_data["train"], batch_size=BATCH_SIZE, train=True, 
-                                 sort_within_batch=True, 
-                                 sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
-                                 device=DEVICE)
-
-valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
-
-model = make_autoencoder(len(NL_SRC.vocab), len(AMR_SRC.vocab),
-                   emb_size=500, hidden_size=500,
-                   num_layers=2, dropout=0.5)
-dev_perplexities = train(model, num_epochs=NUM_EPOCHS, print_every=500, num_batches=NUM_BATCHES, error_per=error_per)
-torch.save(model, f'{exp_name}.pt')
-eval_val(f'{exp_name}.pred', model, valid_iter, AMR_SRC, my_data)
-
-writer.close()
 # ## Attention Visualization
 # 
 # We can also visualize the attention scores of the decoder.
@@ -1074,3 +996,42 @@ def plot_heatmap(src, trg, scores):
 #print("ref", trg)
 #print("pred", pred)
 #plot_heatmap(src, pred, pred_att)
+
+if __name__=="main":
+    # we include lengths to provide to the RNNs
+    LOWER = True
+    NL_SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
+                     unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
+    AMR_SRC = data.Field(batch_first=True, lower=LOWER, include_lengths=True,
+                     unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
+
+
+    my_data = {}
+    error_per = 1/10. 
+
+    for split in ["train", "val", "test"]:
+        my_data[split] = datasets.TranslationDataset(path="data/new_"+split,
+                        exts=('.nl', '.amr'), fields=(NL_SRC, AMR_SRC))
+    MIN_FREQ = 5
+    NL_SRC.build_vocab(my_data["train"].src, min_freq=MIN_FREQ)
+    AMR_SRC.build_vocab(my_data["train"].trg, min_freq=MIN_FREQ)
+
+    PAD_INDEX = AMR_SRC.vocab.stoi[PAD_TOKEN]
+
+    print_data_info(my_data, NL_SRC, AMR_SRC)
+    train_iter = data.BucketIterator(my_data["train"], batch_size=BATCH_SIZE, train=True, 
+                                     sort_within_batch=True, 
+                                     sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
+                                     device=DEVICE)
+
+    valid_iter = data.Iterator(my_data["val"], batch_size=1, train=False, sort=False, repeat=False, device=DEVICE)
+
+    model = make_autoencoder(len(NL_SRC.vocab), len(AMR_SRC.vocab),
+                       emb_size=500, hidden_size=500,
+                       num_layers=2, dropout=0.5)
+    dev_perplexities = train(model, num_epochs=NUM_EPOCHS, print_every=500, num_batches=NUM_BATCHES, error_per=error_per)
+    torch.save(model, f'{exp_name}.pt')
+    eval_val(f'{exp_name}.pred', model, valid_iter, AMR_SRC, my_data)
+
+    writer.close()
+
